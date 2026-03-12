@@ -8,11 +8,18 @@ const { Boom } = require("@hapi/boom");
 const pino = require("pino");
 const express = require("express");
 const QRCode = require("qrcode");
+const fs = require("fs");
 
 const app = express();
 let lastQR = null;
 let botStatus = "waiting for QR...";
 const AUTH_PATH = process.env.RAILWAY_ENVIRONMENT ? "/app/auth" : "./auth";
+
+// clear corrupted auth on startup
+if (fs.existsSync(AUTH_PATH)) {
+  fs.rmSync(AUTH_PATH, { recursive: true, force: true });
+  console.log("[auth] cleared old session");
+}
 
 app.get("/", async (req, res) => {
   if (!lastQR) {
@@ -46,15 +53,12 @@ function isBotMentioned(msg, botJid, botLid) {
   const botNumber = cleanBotJid.split("@")[0];
   const mentioned =
     msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
-
   for (const jid of mentioned) {
     const cleanJid = jid.replace(/:\d+/, "");
     if (cleanJid === cleanBotJid) return true;
     if (botLid && cleanJid === botLid.replace(/:\d+/, "")) return true;
-    // match by number portion only
     if (cleanJid.split("@")[0] === botNumber) return true;
   }
-
   return getMessageText(msg).includes(botNumber);
 }
 
@@ -76,11 +80,8 @@ async function onMessage(sock, botJid, { messages, type }) {
   for (const msg of messages) {
     if (msg.key.fromMe) continue;
     if (msg.key.remoteJid === "status@broadcast") continue;
-
     const isGroup = msg.key.remoteJid.endsWith("@g.us") || msg.key.remoteJid.endsWith("@lid");
-
     if (isGroup) {
-      // try to get botLid from group metadata
       let botLid = sock.user?.lid || null;
       try {
         const meta = await sock.groupMetadata(msg.key.remoteJid);
@@ -89,13 +90,8 @@ async function onMessage(sock, botJid, { messages, type }) {
         );
         if (me) botLid = me.lid || me.id;
       } catch (_) {}
-
-      console.log("[debug] botJid:", botJid, "| botLid:", botLid);
-      console.log("[debug] mentioned:", msg.message?.extendedTextMessage?.contextInfo?.mentionedJid);
-
       if (!isBotMentioned(msg, botJid, botLid)) continue;
     }
-
     const text = getMessageText(msg).toLowerCase().trim();
     console.log(`[msg] from=${msg.pushName} | text="${text}"`);
     await handleGreeting(sock, msg);
@@ -111,9 +107,7 @@ async function startBot() {
     logger: pino({ level: "silent" }),
     printQRInTerminal: false,
   });
-
   sock.ev.on("creds.update", saveCreds);
-
   sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       lastQR = qr;
@@ -132,7 +126,6 @@ async function startBot() {
       console.log("[connection] botJid:", sock.user?.id);
     }
   });
-
   sock.ev.on("messages.upsert", async (upsert) => {
     const botJid = sock.user?.id;
     if (!botJid) return;
