@@ -6,7 +6,33 @@ const {
 } = require("@whiskeysockets/baileys");
 const { Boom } = require("@hapi/boom");
 const pino = require("pino");
-const qrcode = require("qrcode-terminal");
+const express = require("express");
+const QRCode = require("qrcode");
+
+const app = express();
+let lastQR = null;
+let botStatus = "waiting for QR...";
+
+app.get("/", async (req, res) => {
+  if (!lastQR) {
+    return res.send(`
+      <html><body style="background:#111;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+        <h2>${botStatus}</h2>
+      </body></html>
+    `);
+  }
+  const qrImage = await QRCode.toDataURL(lastQR);
+  res.send(`
+    <html><body style="background:#111;color:#fff;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;gap:16px">
+      <h2>Scan with WhatsApp</h2>
+      <img src="${qrImage}" style="width:280px;height:280px;border-radius:12px"/>
+      <p style="color:#aaa;font-size:14px">Refresh if expired</p>
+    </body></html>
+  `);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`[web] QR page running on port ${PORT}`));
 
 function getMessageText(msg) {
   const m = msg.message;
@@ -29,13 +55,11 @@ function isBotMentioned(msg, botJid, botLid) {
   const botNumber = cleanBotJid.split("@")[0];
   const mentioned =
     msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
-
   for (const jid of mentioned) {
     const cleanJid = jid.replace(/:\d+/, "");
     if (cleanJid === cleanBotJid) return true;
     if (botLid && cleanJid === botLid) return true;
   }
-
   return getMessageText(msg).includes(botNumber);
 }
 
@@ -74,12 +98,16 @@ async function startBot() {
     logger: pino({ level: "silent" }),
     printQRInTerminal: false,
   });
+
   sock.ev.on("creds.update", saveCreds);
 
   let botLid = null;
 
   sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
-    if (qr) qrcode.generate(qr, { small: true });
+    if (qr) {
+      lastQR = qr;
+      console.log("[qr] New QR generated — open your Railway URL to scan");
+    }
     if (connection === "close") {
       const shouldReconnect =
         new Boom(lastDisconnect?.error)?.output?.statusCode !==
@@ -87,21 +115,17 @@ async function startBot() {
       console.log(shouldReconnect ? "[connection] reconnecting…" : "[connection] logged out.");
       if (shouldReconnect) startBot();
     } else if (connection === "open") {
-      // grab LID from account info if available
+      lastQR = null;
       botLid = sock.user?.lid?.replace(/:\d+/, "") || null;
+      botStatus = "✅ Bot is online!";
       console.log("[connection] ✅ Bot is online!");
-      console.log("[connection] botJid:", sock.user?.id);
-      console.log("[connection] botLid:", botLid);
     }
   });
 
   sock.ev.on("messages.upsert", async (upsert) => {
     const botJid = sock.user?.id;
     if (!botJid) return;
-    // fallback: extract lid from first group message if not set yet
-    if (!botLid) {
-      botLid = sock.user?.lid?.replace(/:\d+/, "") || null;
-    }
+    if (!botLid) botLid = sock.user?.lid?.replace(/:\d+/, "") || null;
     try {
       await onMessage(sock, botJid, botLid, upsert);
     } catch (err) {
