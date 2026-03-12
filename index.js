@@ -1,43 +1,32 @@
+require("dotenv").config();
+
 const {
   makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
 } = require("@whiskeysockets/baileys");
+
 const { Boom } = require("@hapi/boom");
 const pino = require("pino");
-const express = require("express");
-const QRCode = require("qrcode");
-const fs = require("fs");
-const path = require("path");
+const qrcode = require("qrcode-terminal");
+const Groq = require("groq-sdk");
 
-const app = express();
-let lastQR = null;
-let botStatus = "waiting for QR...";
-const AUTH_PATH = process.env.RAILWAY_ENVIRONMENT ? "/app/auth" : "./auth";
-
-// clear contents of auth folder (not the folder itself) on startup
-if (fs.existsSync(AUTH_PATH)) {
-  for (const file of fs.readdirSync(AUTH_PATH)) {
-    fs.rmSync(path.join(AUTH_PATH, file), { recursive: true, force: true });
-  }
-  console.log("[auth] cleared old session files");
-}
-
-app.get("/", async (req, res) => {
-  if (!lastQR) {
-    return res.send(`<html><body style="background:#111;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><h2>${botStatus}</h2></body></html>`);
-  }
-  const qrImage = await QRCode.toDataURL(lastQR);
-  res.send(`<html><body style="background:#111;color:#fff;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;gap:16px"><h2>Scan with WhatsApp</h2><img src="${qrImage}" style="width:280px;height:280px;border-radius:12px"/><p style="color:#aaa;font-size:14px">Refresh if expired</p></body></html>`);
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[web] QR page running on port ${PORT}`));
 
+// 🧠 Conversation memory
+const chatMemory = {};
+const MEMORY_LIMIT = 10;
+
+
+// Extract message text
 function getMessageText(msg) {
   const m = msg.message;
   if (!m) return "";
+
   return (
     m.conversation ||
     m.extendedTextMessage?.text ||
@@ -47,97 +36,215 @@ function getMessageText(msg) {
   );
 }
 
+
+// Extract context info
+function getContextInfo(msg) {
+  return (
+    msg.message?.extendedTextMessage?.contextInfo ||
+    msg.message?.imageMessage?.contextInfo ||
+    msg.message?.videoMessage?.contextInfo ||
+    {}
+  );
+}
+
+
+// Sender name
 function getSenderName(msg) {
   return msg.pushName || msg.key.participant?.split("@")[0] || "there";
 }
 
-function isBotMentioned(msg, botJid, botLid) {
+
+// Check mention or reply
+function isBotMentionedOrReplied(msg, botJid, botLid) {
   const cleanBotJid = botJid.replace(/:\d+/, "");
   const botNumber = cleanBotJid.split("@")[0];
-  const mentioned =
-    msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+
+  const ctx = getContextInfo(msg);
+  const mentioned = ctx.mentionedJid || [];
+
   for (const jid of mentioned) {
-    const cleanJid = jid.replace(/:\d+/, "");
-    if (cleanJid === cleanBotJid) return true;
-    if (botLid && cleanJid === botLid.replace(/:\d+/, "")) return true;
-    if (cleanJid.split("@")[0] === botNumber) return true;
+    const clean = jid.replace(/:\d+/, "");
+    if (clean === cleanBotJid) return true;
+    if (botLid && clean === botLid) return true;
   }
+
+  const quotedSender = ctx.participant || ctx.remoteJid;
+  if (quotedSender) {
+    const cleanQuoted = quotedSender.replace(/:\d+/, "");
+    if (cleanQuoted === cleanBotJid) return true;
+    if (botLid && cleanQuoted === botLid) return true;
+  }
+
   return getMessageText(msg).includes(botNumber);
 }
 
-async function handleGreeting(sock, msg) {
-  const from = msg.key.remoteJid;
-  const senderName = getSenderName(msg);
-  const greetings = [
-    `Hey ${senderName}! 👋 What's up?`,
-    `Heyy ${senderName}! 😄 You called?`,
-    `Yo ${senderName}! 👀 What do you need?`,
-    `Hello ${senderName}! 🙌 How can I help?`,
-  ];
-  const reply = greetings[Math.floor(Math.random() * greetings.length)];
-  await sock.sendMessage(from, { text: reply }, { quoted: msg });
-}
 
-async function onMessage(sock, botJid, { messages, type }) {
-  if (type !== "notify") return;
-  for (const msg of messages) {
-    if (msg.key.fromMe) continue;
-    if (msg.key.remoteJid === "status@broadcast") continue;
-    const isGroup = msg.key.remoteJid.endsWith("@g.us") || msg.key.remoteJid.endsWith("@lid");
-    if (isGroup) {
-      let botLid = sock.user?.lid || null;
-      try {
-        const meta = await sock.groupMetadata(msg.key.remoteJid);
-        const me = meta.participants.find(p =>
-          p.id.replace(/:\d+/, "").split("@")[0] === botJid.replace(/:\d+/, "").split("@")[0]
-        );
-        if (me) botLid = me.lid || me.id;
-      } catch (_) {}
-      if (!isBotMentioned(msg, botJid, botLid)) continue;
+// 🤖 AI reply with memory
+async function getAIReply(chatId, text, name) {
+  try {
+
+    if (!chatMemory[chatId]) {
+      chatMemory[chatId] = [
+        {
+          role: "system",
+          content:
+            "You are a friendly WhatsApp assistant. Keep replies casual, short and helpful.",
+        },
+      ];
     }
-    const text = getMessageText(msg).toLowerCase().trim();
-    console.log(`[msg] from=${msg.pushName} | text="${text}"`);
-    await handleGreeting(sock, msg);
+
+    chatMemory[chatId].push({
+      role: "user",
+      content: `${name}: ${text}`,
+    });
+
+    // limit memory
+    if (chatMemory[chatId].length > MEMORY_LIMIT * 2) {
+      chatMemory[chatId].splice(1, 2);
+    }
+
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: chatMemory[chatId],
+    });
+
+    const reply = completion.choices[0].message.content;
+
+    chatMemory[chatId].push({
+      role: "assistant",
+      content: reply,
+    });
+
+    return reply;
+
+  } catch (err) {
+    console.error("AI error:", err);
+    return "Brain lag 😅 try again.";
   }
 }
 
+
+// Handle reply
+async function handleAI(sock, msg) {
+  const from = msg.key.remoteJid;
+  const senderName = getSenderName(msg);
+  const text = getMessageText(msg);
+
+  try {
+
+    await sock.sendPresenceUpdate("composing", from);
+
+    const aiReply = await getAIReply(from, text, senderName);
+
+    await sock.sendMessage(
+      from,
+      { text: aiReply },
+      { quoted: msg }
+    );
+
+    await sock.sendPresenceUpdate("paused", from);
+
+  } catch (err) {
+    console.error("reply error:", err);
+  }
+}
+
+
+// Message handler
+async function onMessage(sock, botJid, botLid, { messages, type }) {
+
+  if (type !== "notify" && type !== "append") return;
+
+  for (const msg of messages) {
+
+    if (!msg.message) continue;
+    if (msg.key.fromMe) continue;
+    if (msg.key.remoteJid === "status@broadcast") continue;
+
+    const from = msg.key.remoteJid;
+    const isGroup = from.endsWith("@g.us");
+
+    const text = getMessageText(msg).trim();
+
+    if (!text) continue;
+    if (text.length > 400) continue;
+
+    if (isGroup && !isBotMentionedOrReplied(msg, botJid, botLid)) continue;
+
+    console.log(`[msg] ${from} | ${msg.pushName}: ${text}`);
+
+    await handleAI(sock, msg);
+
+  }
+}
+
+
+// Start bot
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_PATH);
+
+  const { state, saveCreds } = await useMultiFileAuthState("./auth");
   const { version } = await fetchLatestBaileysVersion();
+
   const sock = makeWASocket({
     version,
     auth: state,
     logger: pino({ level: "silent" }),
     printQRInTerminal: false,
   });
+
   sock.ev.on("creds.update", saveCreds);
+
+  let botLid = null;
+
   sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
-      lastQR = qr;
-      console.log("[qr] New QR generated — open your Railway URL to scan");
-    }
+
+    if (qr) qrcode.generate(qr, { small: true });
+
     if (connection === "close") {
+
       const shouldReconnect =
         new Boom(lastDisconnect?.error)?.output?.statusCode !==
         DisconnectReason.loggedOut;
-      console.log(shouldReconnect ? "[connection] reconnecting…" : "[connection] logged out.");
+
+      console.log(
+        shouldReconnect
+          ? "[connection] reconnecting..."
+          : "[connection] logged out."
+      );
+
       if (shouldReconnect) startBot();
-    } else if (connection === "open") {
-      lastQR = null;
-      botStatus = "✅ Bot is online!";
-      console.log("[connection] ✅ Bot is online!");
-      console.log("[connection] botJid:", sock.user?.id);
+
     }
+
+    if (connection === "open") {
+
+      botLid = sock.user?.lid?.replace(/:\d+/, "") || null;
+
+      console.log("✅ Bot online");
+      console.log("Bot JID:", sock.user?.id);
+      console.log("Bot LID:", botLid);
+
+    }
+
   });
+
   sock.ev.on("messages.upsert", async (upsert) => {
+
     const botJid = sock.user?.id;
     if (!botJid) return;
+
+    if (!botLid) {
+      botLid = sock.user?.lid?.replace(/:\d+/, "") || null;
+    }
+
     try {
-      await onMessage(sock, botJid, upsert);
+      await onMessage(sock, botJid, botLid, upsert);
     } catch (err) {
       console.error("[error]", err);
     }
+
   });
+
 }
 
 startBot();
