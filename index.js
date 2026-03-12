@@ -13,6 +13,8 @@ const app = express();
 let lastQR = null;
 let botStatus = "waiting for QR...";
 
+const AUTH_PATH = process.env.RAILWAY_ENVIRONMENT ? "/app/auth" : "./auth";
+
 app.get("/", async (req, res) => {
   if (!lastQR) {
     return res.send(`
@@ -90,7 +92,7 @@ async function onMessage(sock, botJid, botLid, { messages, type }) {
 }
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState("./auth");
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_PATH);
   const { version } = await fetchLatestBaileysVersion();
   const sock = makeWASocket({
     version,
@@ -119,6 +121,8 @@ async function startBot() {
       botLid = sock.user?.lid?.replace(/:\d+/, "") || null;
       botStatus = "✅ Bot is online!";
       console.log("[connection] ✅ Bot is online!");
+      console.log("[connection] botJid:", sock.user?.id);
+      console.log("[connection] botLid:", botLid);
     }
   });
 
