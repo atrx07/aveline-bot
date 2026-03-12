@@ -9,16 +9,19 @@ const pino = require("pino");
 const express = require("express");
 const QRCode = require("qrcode");
 const fs = require("fs");
+const path = require("path");
 
 const app = express();
 let lastQR = null;
 let botStatus = "waiting for QR...";
 const AUTH_PATH = process.env.RAILWAY_ENVIRONMENT ? "/app/auth" : "./auth";
 
-// clear corrupted auth on startup
+// clear contents of auth folder (not the folder itself) on startup
 if (fs.existsSync(AUTH_PATH)) {
-  fs.rmSync(AUTH_PATH, { recursive: true, force: true });
-  console.log("[auth] cleared old session");
+  for (const file of fs.readdirSync(AUTH_PATH)) {
+    fs.rmSync(path.join(AUTH_PATH, file), { recursive: true, force: true });
+  }
+  console.log("[auth] cleared old session files");
 }
 
 app.get("/", async (req, res) => {
