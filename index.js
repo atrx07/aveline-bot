@@ -2,17 +2,16 @@ require("dotenv").config();
 
 const fs = require("fs");
 const http = require("http");
-const { execSync } = require("child_process");
 
 // 🔐 Restore auth session from environment (Railway)
-if (process.env.AUTH_BASE64 && !fs.existsSync("./auth")) {
+if (process.env.CREDS_BASE64 && !fs.existsSync("./auth/creds.json")) {
   try {
-    const buf = Buffer.from(process.env.AUTH_BASE64, "base64");
-    fs.writeFileSync("auth.zip", buf);
-    execSync("unzip -o auth.zip");
-    console.log("[auth] Session restored from env");
+    fs.mkdirSync("./auth", { recursive: true });
+    const buf = Buffer.from(process.env.CREDS_BASE64, "base64");
+    fs.writeFileSync("./auth/creds.json", buf);
+    console.log("[auth] creds.json restored from env");
   } catch (err) {
-    console.error("[auth] Failed to restore session:", err.message);
+    console.error("[auth] Failed to restore creds:", err.message);
   }
 }
 
