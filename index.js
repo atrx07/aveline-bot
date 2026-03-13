@@ -37,9 +37,9 @@ const chatMood = {};
 
 // 🌐 Models for fallback
 const MODELS = [
-  "openai/gpt-oss-120b",
   "llama-3.3-70b-versatile",
   "llama-3.1-8b-instant",
+  "openai/gpt-oss-120b",
 ];
 
 // Extract message text
@@ -93,8 +93,9 @@ function isBotMentionedOrReplied(msg, botJid, botLid) {
   return getMessageText(msg).includes(botNumber);
 }
 
-// 🧠 Build Aveline system prompt dynamically with current mood
-function buildSystemPrompt(mood) {
+// 🧠 Build Aveline system prompt dynamically with per-person mood
+function buildSystemPrompt(chatId) {
+  const mood = chatMood[chatId] || "neutral";
   return `You are Aveline — a real person, not a bot. Never say you're an AI or chatbot.
 
 Identity:
@@ -109,7 +110,7 @@ Personality:
 - You get genuinely curious, excited, annoyed, or affectionate depending on the conversation
 - You tease people you're comfortable with but always stay kind underneath
 
-Current mood: ${mood || "neutral"}
+Your current mood toward this person: ${mood}
 
 Mood behavior:
 - happy → bubbly, enthusiastic, lots of warmth
@@ -183,9 +184,9 @@ Return ONLY one word from: happy, neutral, teasing, annoyed, affectionate`,
 }
 
 // 👤 Creator response
-async function generateCreatorInfo(chatId, mood) {
+async function generateCreatorInfo(chatId) {
   const messages = [
-    { role: "system", content: buildSystemPrompt(mood) },
+    { role: "system", content: buildSystemPrompt(chatId) },
     {
       role: "user",
       content: `The user asked who created you. Respond naturally and warmly. 
@@ -232,33 +233,29 @@ async function callAI(messages) {
   }
 }
 
-// 🤖 AI reply with proper role-based memory + dynamic mood
-async function getAIReply(chatId, text, name, mood) {
-  // Initialize memory for this chat
+// 🤖 AI reply with proper role-based memory + per-person mood
+async function getAIReply(chatId, text, name) {
   if (!chatMemory[chatId]) {
     chatMemory[chatId] = [];
   }
 
-  // Add user message to memory
   chatMemory[chatId].push({
     role: "user",
     content: `${name}: ${text}`,
   });
 
-  // Trim memory to limit (keep pairs)
   if (chatMemory[chatId].length > MEMORY_LIMIT) {
     chatMemory[chatId] = chatMemory[chatId].slice(-MEMORY_LIMIT);
   }
 
-  // Build full message array: fresh system prompt + conversation history
+  // Fresh system prompt with this person's current mood
   const messages = [
-    { role: "system", content: buildSystemPrompt(mood) },
+    { role: "system", content: buildSystemPrompt(chatId) },
     ...chatMemory[chatId],
   ];
 
   const reply = await callAI(messages);
 
-  // Add assistant reply to memory
   chatMemory[chatId].push({
     role: "assistant",
     content: reply,
@@ -282,14 +279,14 @@ async function handleAI(sock, msg) {
       detectMood(text),
     ]);
 
-    // Update mood for this chat
+    // Update this person's mood before generating reply
     chatMood[from] = mood;
 
     let reply;
     if (intent === "CREATOR_QUERY") {
-      reply = await generateCreatorInfo(from, mood);
+      reply = await generateCreatorInfo(from);
     } else {
-      reply = await getAIReply(from, text, senderName, mood);
+      reply = await getAIReply(from, text, senderName);
     }
 
     await sock.sendMessage(from, { text: reply }, { quoted: msg });
