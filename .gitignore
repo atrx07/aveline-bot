@@ -1,4 +1,5 @@
 node_modules/
 auth/
-*.log
 .env
+auth.zip
+auth_b64.txt
