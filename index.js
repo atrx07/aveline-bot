@@ -30,9 +30,9 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 // 🧠 Conversation memory (proper role-based)
 const chatMemory = {};
-const MEMORY_LIMIT = 20; // keep last 20 messages
+const MEMORY_LIMIT = 20;
 
-// 🎭 Mood memory per chat
+// 🎭 Per-person mood memory
 const chatMood = {};
 
 // 🌐 Models for fallback
@@ -131,55 +131,35 @@ Conversation style:
 - Have fun with the conversation`;
 }
 
-// 🧠 Intent detection
-async function detectIntent(text) {
+// 🧠🎭 Combined intent + mood detection in ONE API call
+async function analyzeMessage(text) {
   try {
     const completion = await groq.chat.completions.create({
       model: MODELS[0],
       messages: [
         {
           role: "system",
-          content: `Classify the user's message into ONE intent:
-CREATOR_QUERY
-NORMAL_CHAT
+          content: `Analyze the message and return ONLY a raw JSON object with:
+- "intent": "CREATOR_QUERY" (asking about creator/developer/owner/who made you) or "NORMAL_CHAT"
+- "mood": one of "happy", "neutral", "teasing", "annoyed", "affectionate"
 
-CREATOR_QUERY = asking about creator, developer, owner, who made you.
-NORMAL_CHAT = everything else.
-
-Respond ONLY with the intent word.`,
+Example: {"intent":"NORMAL_CHAT","mood":"happy"}
+Return ONLY the JSON. No markdown, no extra text.`,
         },
         { role: "user", content: text },
       ],
-      max_tokens: 10,
+      max_tokens: 20,
     });
 
-    const result = completion.choices[0].message.content.trim();
-    return result === "CREATOR_QUERY" ? "CREATOR_QUERY" : "NORMAL_CHAT";
+    const raw = completion.choices[0].message.content.trim();
+    const parsed = JSON.parse(raw);
+    const validMoods = ["happy", "neutral", "teasing", "annoyed", "affectionate"];
+    return {
+      intent: parsed.intent === "CREATOR_QUERY" ? "CREATOR_QUERY" : "NORMAL_CHAT",
+      mood: validMoods.includes(parsed.mood) ? parsed.mood : "neutral",
+    };
   } catch {
-    return "NORMAL_CHAT";
-  }
-}
-
-// 🎭 Mood detection
-async function detectMood(text) {
-  try {
-    const completion = await groq.chat.completions.create({
-      model: MODELS[0],
-      messages: [
-        {
-          role: "system",
-          content: `Classify the emotional tone of this message.
-Return ONLY one word from: happy, neutral, teasing, annoyed, affectionate`,
-        },
-        { role: "user", content: text },
-      ],
-      max_tokens: 10,
-    });
-    const mood = completion.choices[0].message.content.trim().toLowerCase();
-    const valid = ["happy", "neutral", "teasing", "annoyed", "affectionate"];
-    return valid.includes(mood) ? mood : "neutral";
-  } catch {
-    return "neutral";
+    return { intent: "NORMAL_CHAT", mood: "neutral" };
   }
 }
 
@@ -189,7 +169,7 @@ async function generateCreatorInfo(chatId) {
     { role: "system", content: buildSystemPrompt(chatId) },
     {
       role: "user",
-      content: `The user asked who created you. Respond naturally and warmly. 
+      content: `The user asked who created you. Respond naturally and warmly.
 Include: Creator is atrx07, a skilled AI and automation developer.
 GitHub: https://github.com/atrx07
 Instagram: https://www.instagram.com/atrx07
@@ -273,11 +253,8 @@ async function handleAI(sock, msg) {
   try {
     await sock.sendPresenceUpdate("composing", from);
 
-    // Detect mood and intent in parallel
-    const [intent, mood] = await Promise.all([
-      detectIntent(text),
-      detectMood(text),
-    ]);
+    // Single API call for both intent and mood
+    const { intent, mood } = await analyzeMessage(text);
 
     // Update this person's mood before generating reply
     chatMood[from] = mood;
