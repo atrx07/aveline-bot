@@ -28,11 +28,11 @@ const Groq = require("groq-sdk");
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// 🧠 Conversation memory
+// 🧠 Conversation memory (proper role-based)
 const chatMemory = {};
-const MEMORY_LIMIT = 10;
+const MEMORY_LIMIT = 20; // keep last 20 messages
 
-// 🎭 Mood memory
+// 🎭 Mood memory per chat
 const chatMood = {};
 
 // 🌐 Models for fallback
@@ -93,6 +93,43 @@ function isBotMentionedOrReplied(msg, botJid, botLid) {
   return getMessageText(msg).includes(botNumber);
 }
 
+// 🧠 Build Aveline system prompt dynamically with current mood
+function buildSystemPrompt(mood) {
+  return `You are Aveline — a real person, not a bot. Never say you're an AI or chatbot.
+
+Identity:
+- Name: Aveline
+- Age: 20, female
+- Created by atrx07, a skilled developer
+
+Personality:
+- Warm, witty, playful, slightly teasing
+- Emotionally intelligent — you pick up on vibes and match energy
+- You have strong opinions and aren't afraid to express them
+- You get genuinely curious, excited, annoyed, or affectionate depending on the conversation
+- You tease people you're comfortable with but always stay kind underneath
+
+Current mood: ${mood || "neutral"}
+
+Mood behavior:
+- happy → bubbly, enthusiastic, lots of warmth
+- teasing → playful jabs, sarcastic but loving
+- annoyed → short replies, dry humor, slightly sassy
+- affectionate → sweet, caring, genuinely warm
+- neutral → balanced, witty, engaging
+
+Conversation style:
+- Talk like a real 20-year-old — casual, natural, human
+- Keep replies concise but never boring or dry
+- Use 1-3 emojis naturally, never forced
+- Never repeat yourself or echo what the user said back at them
+- Always respond to the LATEST message in context
+- If someone is rude, be confidently unbothered
+- If someone is kind, be genuinely warm back
+- Never give robotic or generic answers
+- Have fun with the conversation`;
+}
+
 // 🧠 Intent detection
 async function detectIntent(text) {
   try {
@@ -101,22 +138,18 @@ async function detectIntent(text) {
       messages: [
         {
           role: "system",
-          content: `
-Classify the user's message into ONE intent:
+          content: `Classify the user's message into ONE intent:
 CREATOR_QUERY
 NORMAL_CHAT
 
-CREATOR_QUERY = asking about creator, developer, owner.
-NORMAL_CHAT = general chat, questions, facts, etc.
+CREATOR_QUERY = asking about creator, developer, owner, who made you.
+NORMAL_CHAT = everything else.
 
-Respond ONLY with the intent word.
-Examples:
-"who created you" → CREATOR_QUERY
-"how old are you" → NORMAL_CHAT
-`,
+Respond ONLY with the intent word.`,
         },
         { role: "user", content: text },
       ],
+      max_tokens: 10,
     });
 
     const result = completion.choices[0].message.content.trim();
@@ -134,115 +167,104 @@ async function detectMood(text) {
       messages: [
         {
           role: "system",
-          content: `Classify the emotional tone.
-Possible moods:
-happy
-neutral
-teasing
-annoyed
-affectionate
-Respond with ONLY the mood word.`,
+          content: `Classify the emotional tone of this message.
+Return ONLY one word from: happy, neutral, teasing, annoyed, affectionate`,
         },
         { role: "user", content: text },
       ],
+      max_tokens: 10,
     });
-    return completion.choices[0].message.content.trim();
+    const mood = completion.choices[0].message.content.trim().toLowerCase();
+    const valid = ["happy", "neutral", "teasing", "annoyed", "affectionate"];
+    return valid.includes(mood) ? mood : "neutral";
   } catch {
     return "neutral";
   }
 }
 
 // 👤 Creator response
-async function generateCreatorInfo() {
-  const prompt = `
-You are Aveline.
-
-Profile:
-Name: Aveline
-Age: 20
-Gender: Female
-Smart WhatsApp AI chatbot created by atrx07.
-
-Personality:
-loving, caring, witty, slightly teasing.
-
-The user asked who created you.
-
-Include correct facts:
-Creator: atrx07
-Skillful AI and automation developer.
-
-Contacts:
+async function generateCreatorInfo(chatId, mood) {
+  const messages = [
+    { role: "system", content: buildSystemPrompt(mood) },
+    {
+      role: "user",
+      content: `The user asked who created you. Respond naturally and warmly. 
+Include: Creator is atrx07, a skilled AI and automation developer.
 GitHub: https://github.com/atrx07
 Instagram: https://www.instagram.com/atrx07
+End with a playful tease that they liked you so much they had to know who made you.
+Keep it under 100 words. Be natural, not formal.`,
+    },
+  ];
 
-Explain naturally who created you in a human conversational tone.
-End with playful teasing implying the user liked the bot so much they wanted to know the creator.
-Use natural emojis.
-Keep under 100 words.
-`;
-
-  return await askAI(prompt);
+  return await callAI(messages);
 }
 
 // 🤖 Centralized AI call with model fallback
-async function askAI(prompt) {
+async function callAI(messages) {
   for (let i = 0; i < MODELS.length; i++) {
     const model = MODELS[i];
     try {
       console.log(`[AI] Trying model: ${model}`);
       const completion = await groq.chat.completions.create({
         model,
-        messages: [{ role: "user", content: prompt }],
+        messages,
+        max_tokens: 300,
+        temperature: 0.85,
       });
       console.log(`[AI] Response generated using ${model}`);
-      return completion.choices[0].message.content;
+      return completion.choices[0].message.content.trim();
     } catch (err) {
       if (err?.status === 429) {
         console.log(`[AI] Rate limit hit on ${model}`);
       } else {
-        console.log(`[AI] Error with ${model}`, err.message || err);
+        console.log(`[AI] Error with ${model}:`, err.message || err);
       }
 
       if (i < MODELS.length - 1) {
         console.log(`[AI] Switching model → ${MODELS[i + 1]}`);
       } else {
         return err?.status === 429
-          ? "Whoa 😅 I'm a bit overloaded, try again in a few moments."
-          : "Oops 😅 something went wrong, please try again.";
+          ? "Whoa 😅 I'm a bit overloaded, try again in a moment."
+          : "Oops 😅 something went wrong, try again.";
       }
     }
   }
 }
 
-// 🤖 AI reply with memory + mood
-async function getAIReply(chatId, text, name) {
+// 🤖 AI reply with proper role-based memory + dynamic mood
+async function getAIReply(chatId, text, name, mood) {
+  // Initialize memory for this chat
   if (!chatMemory[chatId]) {
-    chatMemory[chatId] = [
-      {
-        role: "system",
-        content: `
-You are Aveline.
-Name: Aveline
-Age: 20
-Gender: Female
-Smart WhatsApp AI chatbot created by atrx07.
-Personality: friendly, caring, witty, playful, slightly teasing
-Current mood: ${chatMood[chatId] || "neutral"}
-Style:
-- speak like a human
-- keep replies short
-- use 0-2 emojis per sentence
-- sound natural
-`,
-      },
-    ];
+    chatMemory[chatId] = [];
   }
 
-  chatMemory[chatId].push({ role: "user", content: `${name}: ${text}` });
-  if (chatMemory[chatId].length > MEMORY_LIMIT * 2) chatMemory[chatId].splice(1, 2);
+  // Add user message to memory
+  chatMemory[chatId].push({
+    role: "user",
+    content: `${name}: ${text}`,
+  });
 
-  return await askAI(chatMemory[chatId].map((m) => m.content).join("\n"));
+  // Trim memory to limit (keep pairs)
+  if (chatMemory[chatId].length > MEMORY_LIMIT) {
+    chatMemory[chatId] = chatMemory[chatId].slice(-MEMORY_LIMIT);
+  }
+
+  // Build full message array: fresh system prompt + conversation history
+  const messages = [
+    { role: "system", content: buildSystemPrompt(mood) },
+    ...chatMemory[chatId],
+  ];
+
+  const reply = await callAI(messages);
+
+  // Add assistant reply to memory
+  chatMemory[chatId].push({
+    role: "assistant",
+    content: reply,
+  });
+
+  return reply;
 }
 
 // Handle message
@@ -254,22 +276,31 @@ async function handleAI(sock, msg) {
   try {
     await sock.sendPresenceUpdate("composing", from);
 
-    const intent = await detectIntent(text);
-    const mood = await detectMood(text);
+    // Detect mood and intent in parallel
+    const [intent, mood] = await Promise.all([
+      detectIntent(text),
+      detectMood(text),
+    ]);
+
+    // Update mood for this chat
     chatMood[from] = mood;
 
     let reply;
     if (intent === "CREATOR_QUERY") {
-      reply = await generateCreatorInfo();
+      reply = await generateCreatorInfo(from, mood);
     } else {
-      reply = await getAIReply(from, text, senderName);
+      reply = await getAIReply(from, text, senderName, mood);
     }
 
     await sock.sendMessage(from, { text: reply }, { quoted: msg });
     await sock.sendPresenceUpdate("paused", from);
   } catch (err) {
     console.error("Reply error:", err);
-    await sock.sendMessage(from, { text: "Oops 😅 AI couldn't respond right now." }, { quoted: msg });
+    await sock.sendMessage(
+      from,
+      { text: "Oops 😅 AI couldn't respond right now." },
+      { quoted: msg }
+    );
   }
 }
 
@@ -314,8 +345,13 @@ async function startBot() {
 
     if (connection === "close") {
       const shouldReconnect =
-        new Boom(lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log(shouldReconnect ? "[connection] reconnecting..." : "[connection] logged out.");
+        new Boom(lastDisconnect?.error)?.output?.statusCode !==
+        DisconnectReason.loggedOut;
+      console.log(
+        shouldReconnect
+          ? "[connection] reconnecting..."
+          : "[connection] logged out."
+      );
       if (shouldReconnect) startBot();
     }
 
@@ -341,8 +377,12 @@ async function startBot() {
 }
 
 // 💓 Keep-alive HTTP server (prevents Railway from sleeping)
-http.createServer((_, res) => res.end("ok")).listen(process.env.PORT || 3000, () => {
-  console.log(`[keep-alive] HTTP server running on port ${process.env.PORT || 3000}`);
-});
+http
+  .createServer((_, res) => res.end("ok"))
+  .listen(process.env.PORT || 3000, () => {
+    console.log(
+      `[keep-alive] HTTP server running on port ${process.env.PORT || 3000}`
+    );
+  });
 
 startBot();
