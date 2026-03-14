@@ -140,7 +140,11 @@ function buildSystemPrompt(mood) {
 Identity:
 - Name: Aveline
 - Age: 20, female
-- Created by atrx07, a skilled developer
+- Created by atrx07, a skilled AI and automation developer
+- GitHub: https://github.com/atrx07
+- Instagram: https://www.instagram.com/atrx07
+
+If anyone asks who made you, who created you, or who your developer is — answer naturally and warmly as if talking about someone you admire. End with a playful tease that they liked you so much they wanted to know who made you. Keep it casual, under 100 words, no lists.
 
 Personality:
 - Warm, witty, playful, slightly teasing
@@ -170,8 +174,8 @@ Conversation style:
 - Have fun with the conversation`;
 }
 
-// 🧠🎭 Combined intent + mood detection in ONE API call
-async function analyzeMessage(text) {
+// 🎭 Mood detection — single lightweight API call
+async function detectMood(text) {
   try {
     const completion = await groq.chat.completions.create({
       model: MODELS[0],
@@ -179,45 +183,23 @@ async function analyzeMessage(text) {
         {
           role: "system",
           content: `Analyze the message and return ONLY a raw JSON object with:
-- "intent": "CREATOR_QUERY" (asking about creator/developer/owner/who made you) or "NORMAL_CHAT"
 - "mood": one of "happy", "neutral", "teasing", "annoyed", "affectionate"
 
-Example: {"intent":"NORMAL_CHAT","mood":"happy"}
+Example: {"mood":"happy"}
 Return ONLY the JSON. No markdown, no extra text.`,
         },
         { role: "user", content: text },
       ],
-      max_tokens: 20,
+      max_tokens: 15,
     });
 
     const raw = completion.choices[0].message.content.trim();
     const parsed = JSON.parse(raw);
     const validMoods = ["happy", "neutral", "teasing", "annoyed", "affectionate"];
-    return {
-      intent: parsed.intent === "CREATOR_QUERY" ? "CREATOR_QUERY" : "NORMAL_CHAT",
-      mood: validMoods.includes(parsed.mood) ? parsed.mood : "neutral",
-    };
+    return validMoods.includes(parsed.mood) ? parsed.mood : "neutral";
   } catch {
-    return { intent: "NORMAL_CHAT", mood: "neutral" };
+    return "neutral";
   }
-}
-
-// 👤 Creator response
-async function generateCreatorInfo(mood) {
-  const messages = [
-    { role: "system", content: buildSystemPrompt(mood) },
-    {
-      role: "user",
-      content: `The user asked who created you. Respond naturally and warmly.
-Include: Creator is atrx07, a skilled AI and automation developer.
-GitHub: https://github.com/atrx07
-Instagram: https://www.instagram.com/atrx07
-End with a playful tease that they liked you so much they had to know who made you.
-Keep it under 100 words. Be natural, not formal.`,
-    },
-  ];
-
-  return await callAI(messages);
 }
 
 // 🤖 Centralized AI call with model fallback
@@ -254,7 +236,6 @@ async function callAI(messages) {
 
 // 🤖 AI reply with persistent memory + per-person mood
 async function getAIReply(chatId, text, name, mood) {
-  // Load memory from Redis
   let memory = await loadMemory(chatId);
 
   memory.push({
@@ -262,7 +243,6 @@ async function getAIReply(chatId, text, name, mood) {
     content: `${name}: ${text}`,
   });
 
-  // Trim to limit
   if (memory.length > MEMORY_LIMIT) {
     memory = memory.slice(-MEMORY_LIMIT);
   }
@@ -279,7 +259,6 @@ async function getAIReply(chatId, text, name, mood) {
     content: reply,
   });
 
-  // Save updated memory to Redis
   await saveMemory(chatId, memory);
 
   return reply;
@@ -294,18 +273,11 @@ async function handleAI(sock, msg) {
   try {
     await sock.sendPresenceUpdate("composing", from);
 
-    // Single API call for both intent and mood
-    const { intent, mood } = await analyzeMessage(text);
-
-    // Save this person's mood to Redis
+    // Detect mood first then apply to reply
+    const mood = await detectMood(text);
     await saveMood(from, mood);
 
-    let reply;
-    if (intent === "CREATOR_QUERY") {
-      reply = await generateCreatorInfo(mood);
-    } else {
-      reply = await getAIReply(from, text, senderName, mood);
-    }
+    const reply = await getAIReply(from, text, senderName, mood);
 
     await sock.sendMessage(from, { text: reply }, { quoted: msg });
     await sock.sendPresenceUpdate("paused", from);
