@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const fs = require("fs");
 const http = require("http");
+const { Redis } = require("@upstash/redis");
 
 // 🔐 Restore auth session from environment (Railway)
 if (process.env.CREDS_BASE64 && !fs.existsSync("./auth/creds.json")) {
@@ -14,6 +15,12 @@ if (process.env.CREDS_BASE64 && !fs.existsSync("./auth/creds.json")) {
     console.error("[auth] Failed to restore creds:", err.message);
   }
 }
+
+// 🔴 Redis client for persistent memory
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
 const {
   makeWASocket,
@@ -28,12 +35,7 @@ const Groq = require("groq-sdk");
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// 🧠 Conversation memory (proper role-based)
-const chatMemory = {};
 const MEMORY_LIMIT = 20;
-
-// 🎭 Per-person mood memory
-const chatMood = {};
 
 // 🌐 Models for fallback
 const MODELS = [
@@ -41,6 +43,44 @@ const MODELS = [
   "llama-3.1-8b-instant",
   "openai/gpt-oss-120b",
 ];
+
+// 💾 Load memory from Redis
+async function loadMemory(chatId) {
+  try {
+    const data = await redis.get(`memory:${chatId}`);
+    return data ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+// 💾 Save memory to Redis
+async function saveMemory(chatId, memory) {
+  try {
+    await redis.set(`memory:${chatId}`, memory);
+  } catch (err) {
+    console.error("[redis] Failed to save memory:", err.message);
+  }
+}
+
+// 💾 Load mood from Redis
+async function loadMood(chatId) {
+  try {
+    const mood = await redis.get(`mood:${chatId}`);
+    return mood || "neutral";
+  } catch {
+    return "neutral";
+  }
+}
+
+// 💾 Save mood to Redis
+async function saveMood(chatId, mood) {
+  try {
+    await redis.set(`mood:${chatId}`, mood);
+  } catch (err) {
+    console.error("[redis] Failed to save mood:", err.message);
+  }
+}
 
 // Extract message text
 function getMessageText(msg) {
@@ -94,8 +134,7 @@ function isBotMentionedOrReplied(msg, botJid, botLid) {
 }
 
 // 🧠 Build Aveline system prompt dynamically with per-person mood
-function buildSystemPrompt(chatId) {
-  const mood = chatMood[chatId] || "neutral";
+function buildSystemPrompt(mood) {
   return `You are Aveline — a real person, not a bot. Never say you're an AI or chatbot.
 
 Identity:
@@ -164,9 +203,9 @@ Return ONLY the JSON. No markdown, no extra text.`,
 }
 
 // 👤 Creator response
-async function generateCreatorInfo(chatId) {
+async function generateCreatorInfo(mood) {
   const messages = [
-    { role: "system", content: buildSystemPrompt(chatId) },
+    { role: "system", content: buildSystemPrompt(mood) },
     {
       role: "user",
       content: `The user asked who created you. Respond naturally and warmly.
@@ -213,33 +252,35 @@ async function callAI(messages) {
   }
 }
 
-// 🤖 AI reply with proper role-based memory + per-person mood
-async function getAIReply(chatId, text, name) {
-  if (!chatMemory[chatId]) {
-    chatMemory[chatId] = [];
-  }
+// 🤖 AI reply with persistent memory + per-person mood
+async function getAIReply(chatId, text, name, mood) {
+  // Load memory from Redis
+  let memory = await loadMemory(chatId);
 
-  chatMemory[chatId].push({
+  memory.push({
     role: "user",
     content: `${name}: ${text}`,
   });
 
-  if (chatMemory[chatId].length > MEMORY_LIMIT) {
-    chatMemory[chatId] = chatMemory[chatId].slice(-MEMORY_LIMIT);
+  // Trim to limit
+  if (memory.length > MEMORY_LIMIT) {
+    memory = memory.slice(-MEMORY_LIMIT);
   }
 
-  // Fresh system prompt with this person's current mood
   const messages = [
-    { role: "system", content: buildSystemPrompt(chatId) },
-    ...chatMemory[chatId],
+    { role: "system", content: buildSystemPrompt(mood) },
+    ...memory,
   ];
 
   const reply = await callAI(messages);
 
-  chatMemory[chatId].push({
+  memory.push({
     role: "assistant",
     content: reply,
   });
+
+  // Save updated memory to Redis
+  await saveMemory(chatId, memory);
 
   return reply;
 }
@@ -256,14 +297,14 @@ async function handleAI(sock, msg) {
     // Single API call for both intent and mood
     const { intent, mood } = await analyzeMessage(text);
 
-    // Update this person's mood before generating reply
-    chatMood[from] = mood;
+    // Save this person's mood to Redis
+    await saveMood(from, mood);
 
     let reply;
     if (intent === "CREATOR_QUERY") {
-      reply = await generateCreatorInfo(from);
+      reply = await generateCreatorInfo(mood);
     } else {
-      reply = await getAIReply(from, text, senderName);
+      reply = await getAIReply(from, text, senderName, mood);
     }
 
     await sock.sendMessage(from, { text: reply }, { quoted: msg });
