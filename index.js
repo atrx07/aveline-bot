@@ -3,6 +3,7 @@ require("dotenv").config();
 const fs = require("fs");
 const http = require("http");
 const { Redis } = require("@upstash/redis");
+const Groq = require("groq-sdk");
 
 // 🔐 Restore auth session from environment (Railway)
 if (process.env.CREDS_BASE64 && !fs.existsSync("./auth/creds.json")) {
@@ -22,6 +23,15 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
+// 🔑 Multiple Groq clients — one per API key
+const GROQ_CLIENTS = [
+  process.env.GROQ_API_KEY_1,
+  process.env.GROQ_API_KEY_2,
+  process.env.GROQ_API_KEY_3,
+]
+  .filter(Boolean)
+  .map((key) => new Groq({ apiKey: key }));
+
 const {
   makeWASocket,
   useMultiFileAuthState,
@@ -31,9 +41,6 @@ const {
 const { Boom } = require("@hapi/boom");
 const pino = require("pino");
 const qrcode = require("qrcode-terminal");
-const Groq = require("groq-sdk");
-
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 const MEMORY_LIMIT = 20;
 
@@ -179,10 +186,10 @@ Conversation style:
 - Have fun with the conversation`;
 }
 
-// 🎭 Mood detection — single lightweight API call
+// 🎭 Mood detection
 async function detectMood(text) {
   try {
-    const completion = await groq.chat.completions.create({
+    const completion = await GROQ_CLIENTS[0].chat.completions.create({
       model: MODELS[0],
       messages: [
         {
@@ -207,36 +214,46 @@ Return ONLY the JSON. No markdown, no extra text.`,
   }
 }
 
-// 🤖 Centralized AI call with model fallback
+// 🤖 Centralized AI call — key fallback first, then model fallback
 async function callAI(messages) {
-  for (let i = 0; i < MODELS.length; i++) {
-    const model = MODELS[i];
-    try {
-      console.log(`[AI] Trying model: ${model}`);
-      const completion = await groq.chat.completions.create({
-        model,
-        messages,
-        max_tokens: 300,
-        temperature: 0.85,
-      });
-      console.log(`[AI] Response generated using ${model}`);
-      return completion.choices[0].message.content.trim();
-    } catch (err) {
-      if (err?.status === 429) {
-        console.log(`[AI] Rate limit hit on ${model}`);
-      } else {
-        console.log(`[AI] Error with ${model}:`, err.message || err);
-      }
+  for (let m = 0; m < MODELS.length; m++) {
+    const model = MODELS[m];
+    for (let k = 0; k < GROQ_CLIENTS.length; k++) {
+      const client = GROQ_CLIENTS[k];
+      try {
+        console.log(`[AI] Trying key ${k + 1} / model: ${model}`);
 
-      if (i < MODELS.length - 1) {
-        console.log(`[AI] Switching model → ${MODELS[i + 1]}`);
-      } else {
-        return err?.status === 429
-          ? "Whoa 😅 I'm a bit overloaded, try again in a moment."
-          : "Oops 😅 something went wrong, try again.";
+        const timeout = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("timeout")), 4000)
+        );
+
+        const completion = await Promise.race([
+          client.chat.completions.create({
+            model,
+            messages,
+            max_tokens: 300,
+            temperature: 0.85,
+          }),
+          timeout,
+        ]);
+
+        console.log(`[AI] Response from key ${k + 1} / model: ${model}`);
+        return completion.choices[0].message.content.trim();
+      } catch (err) {
+        if (err?.status === 429 || err.message === "timeout") {
+          console.log(`[AI] Key ${k + 1} failed on ${model} (${err.message || "rate limit"}) → trying next`);
+        } else {
+          console.log(`[AI] Key ${k + 1} error on ${model}:`, err.message || err);
+        }
       }
     }
+    // All keys exhausted for this model, try next model
+    if (m < MODELS.length - 1) {
+      console.log(`[AI] All keys exhausted for ${model} → switching to ${MODELS[m + 1]}`);
+    }
   }
+
+  return "Whoa 😅 I'm a bit overloaded right now, try again in a moment.";
 }
 
 // 🤖 AI reply with persistent memory + per-person mood
@@ -319,6 +336,10 @@ async function onMessage(sock, botJid, botLid, { messages, type }) {
 // Start bot
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState("./auth");
+  console.log("[debug] Key 1:", process.env.GROQ_API_KEY_1?.slice(0, 8));
+  console.log("[debug] Key 2:", process.env.GROQ_API_KEY_2?.slice(0, 8));
+  console.log("[debug] Key 3:", process.env.GROQ_API_KEY_3?.slice(0, 8));
+  console.log("[debug] Clients loaded:", GROQ_CLIENTS.length);
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
@@ -350,6 +371,7 @@ async function startBot() {
     if (connection === "open") {
       botLid = sock.user?.lid?.replace(/:\d+/, "") || null;
       console.log("✅ Bot online");
+      console.log(`[AI] ${GROQ_CLIENTS.length} Groq key(s) loaded`);
       console.log("Bot JID:", sock.user?.id);
       console.log("Bot LID:", botLid);
     }
