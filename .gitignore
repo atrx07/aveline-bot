@@ -3,3 +3,5 @@ auth/
 .env
 auth.zip
 auth_b64.txt
+auth_compressed.zip
+creds_b64.txt
