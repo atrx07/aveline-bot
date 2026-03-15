@@ -371,10 +371,17 @@ async function handleAI(sock, msg) {
     stats.responseTimes.push(responseTime);
     if (stats.responseTimes.length > 100) stats.responseTimes.shift();
 
+    // Get group name for feed
+    let groupName = null;
+    if (isGroup) {
+      try { groupName = await redis.get(`name:${from}`); } catch {}
+    }
+
     addToFeed({
       type: "message",
       from,
       name: senderName,
+      groupName,
       isGroup,
       text: text.slice(0, 200),
       reply: reply.slice(0, 200),
@@ -606,3 +613,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`[api] Server running on port ${PORT}`));
 
 startBot();
+
