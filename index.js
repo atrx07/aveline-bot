@@ -419,7 +419,6 @@ async function onMessage(sock, botJid, botLid, { messages, type }) {
     if (isGroup) {
       const participant = msg.key.participant || "";
       const userId = participant.replace(/:\d+/, "");
-      console.log(`[debug-bl] participant raw: ${participant} | cleaned: ${userId}`);
       if (userId && await isBlacklisted(userId)) {
         console.log(`[blacklist] Ignored group message from member ${userId}`);
         continue;
@@ -624,3 +623,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`[api] Server running on port ${PORT}`));
 
 startBot();
+
