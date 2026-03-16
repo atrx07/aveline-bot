@@ -585,7 +585,42 @@ async function startBot() {
   });
 
   botSocket = sock;
-  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("creds.update", async () => {
+    saveCreds();
+    // Auto-update CREDS_BASE64 on Railway when session keys rotate
+    try {
+      const newCreds = fs.readFileSync("./auth/creds.json");
+      const encoded = newCreds.toString("base64");
+      const projectId = process.env.RAILWAY_PROJECT_ID;
+      const serviceId = process.env.RAILWAY_SERVICE_ID;
+      const token = process.env.RAILWAY_TOKEN;
+      if (!projectId || !serviceId || !token) return;
+
+      const query = `
+        mutation {
+          variableUpsert(input: {
+            projectId: "${projectId}"
+            serviceId: "${serviceId}"
+            environmentId: null
+            name: "CREDS_BASE64"
+            value: "${encoded}"
+          })
+        }
+      `;
+
+      await fetch("https://backboard.railway.app/graphql/v2", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + token,
+        },
+        body: JSON.stringify({ query }),
+      });
+      console.log("[creds] CREDS_BASE64 updated on Railway");
+    } catch (err) {
+      console.error("[creds] Failed to update Railway variable:", err.message);
+    }
+  });
   let botLid = null;
 
   sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
@@ -623,4 +658,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`[api] Server running on port ${PORT}`));
 
 startBot();
-
