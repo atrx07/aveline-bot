@@ -415,6 +415,17 @@ async function onMessage(sock, botJid, botLid, { messages, type }) {
       continue;
     }
 
+    // Also check individual sender in group chats
+    if (isGroup) {
+      const participant = msg.key.participant || "";
+      const userId = participant.replace(/:\d+/, "");
+      console.log(`[debug-bl] participant raw: ${participant} | cleaned: ${userId}`);
+      if (userId && await isBlacklisted(userId)) {
+        console.log(`[blacklist] Ignored group message from member ${userId}`);
+        continue;
+      }
+    }
+
     console.log(`[msg] ${from} | ${msg.pushName}: ${text}`);
     await handleAI(sock, msg);
   }
