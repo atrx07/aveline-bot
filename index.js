@@ -566,6 +566,49 @@ app.post("/api/blacklist/:chatId", authMiddleware, async (req, res) => {
   }
 });
 
+// 📢 Announcement endpoint
+app.post("/api/announce", authMiddleware, async (req, res) => {
+  try {
+    const { message, sendToDMs, sendToGroups } = req.body;
+    if (!message) return res.status(400).json({ error: "Message is required" });
+    if (!sendToDMs && !sendToGroups) return res.status(400).json({ error: "Select at least one target" });
+    if (!botSocket) return res.status(503).json({ error: "Bot is not connected" });
+
+    const chatIds = await getAllChatIds();
+    const targets = chatIds.filter(id => {
+      const isGroup = id.endsWith("@g.us");
+      if (isGroup && sendToGroups) return true;
+      if (!isGroup && sendToDMs) return true;
+      return false;
+    });
+
+    let sent = 0;
+    let failed = 0;
+
+    // Send with random 2-4s delay between each
+    for (const chatId of targets) {
+      try {
+        await botSocket.sendMessage(chatId, { text: message });
+        sent++;
+        console.log(`[announce] Sent to ${chatId}`);
+        addToFeed({ type: "system", message: `Announcement sent to ${chatId}` });
+      } catch (err) {
+        failed++;
+        console.error(`[announce] Failed to send to ${chatId}:`, err.message);
+      }
+      // Random delay 2000-4000ms between messages
+      if (targets.indexOf(chatId) < targets.length - 1) {
+        const delay = 2000 + Math.floor(Math.random() * 2000);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+
+    res.json({ success: true, sent, failed, total: targets.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/", (_, res) => res.send("ok"));
 
 async function startBot() {
