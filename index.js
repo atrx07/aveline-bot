@@ -66,6 +66,23 @@ const stats = {
 // 📜 Live feed
 const liveFeed = [];
 
+// 🔒 Login rate limiting
+const loginAttempts = {};
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_DURATION = 10 * 60 * 1000; // 10 minutes
+
+function getRateLimit(ip) {
+  const now = Date.now();
+  if (!loginAttempts[ip]) loginAttempts[ip] = { count: 0, lockedUntil: null };
+  const entry = loginAttempts[ip];
+  // Reset if lockout has expired
+  if (entry.lockedUntil && now > entry.lockedUntil) {
+    entry.count = 0;
+    entry.lockedUntil = null;
+  }
+  return entry;
+}
+
 // 🤖 Bot state
 let botPaused = false;
 let botSocket = null;
@@ -449,11 +466,33 @@ function authMiddleware(req, res, next) {
 }
 
 app.post("/api/login", (req, res) => {
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown";
+  const entry = getRateLimit(ip);
+  const now = Date.now();
+
+  // Check if locked out
+  if (entry.lockedUntil && now < entry.lockedUntil) {
+    const minutesLeft = Math.ceil((entry.lockedUntil - now) / 60000);
+    return res.status(429).json({ error: "locked", minutesLeft });
+  }
+
   const { username, password } = req.body;
   if (username === process.env.DASHBOARD_USER && password === process.env.DASHBOARD_PASS) {
+    entry.count = 0;
+    entry.lockedUntil = null;
     return res.json({ token: process.env.DASHBOARD_TOKEN });
   }
-  return res.status(401).json({ error: "Invalid credentials" });
+
+  // Failed attempt
+  entry.count++;
+  const attemptsLeft = MAX_ATTEMPTS - entry.count;
+
+  if (attemptsLeft <= 0) {
+    entry.lockedUntil = now + LOCKOUT_DURATION;
+    return res.status(429).json({ error: "locked", minutesLeft: 10 });
+  }
+
+  return res.status(401).json({ error: "invalid", attemptsLeft });
 });
 
 app.get("/api/status", authMiddleware, (req, res) => {
