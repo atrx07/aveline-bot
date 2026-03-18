@@ -86,6 +86,7 @@ function getRateLimit(ip) {
 // 🤖 Bot state
 let botPaused = false;
 let botSocket = null;
+let stickerCaptureMode = false;
 
 function addToFeed(entry) {
   liveFeed.unshift({ ...entry, timestamp: Date.now() });
@@ -175,6 +176,46 @@ async function saveStats() {
       rateLimitHits: stats.rateLimitHits,
     });
   } catch {}
+}
+
+// 🎭 Sticker helpers
+async function saveStandbySticker(id, data) {
+  try { await redis.set(`sticker:standby:${id}`, data); } catch {}
+}
+
+async function getStandbyStickers() {
+  try {
+    const keys = await redis.keys("sticker:standby:*");
+    const stickers = await Promise.all(keys.map(async k => {
+      const data = await redis.get(k);
+      return { id: k.replace("sticker:standby:", ""), ...data };
+    }));
+    return stickers.filter(Boolean);
+  } catch { return []; }
+}
+
+async function getMoodStickers(mood) {
+  try {
+    const keys = await redis.keys(`sticker:mood:${mood}:*`);
+    const stickers = await Promise.all(keys.map(async k => {
+      const data = await redis.get(k);
+      return { id: k.replace(`sticker:mood:${mood}:`, ""), mood, ...data };
+    }));
+    return stickers.filter(Boolean);
+  } catch { return []; }
+}
+
+async function getRandomSticker(mood) {
+  try {
+    const stickers = await getMoodStickers(mood);
+    if (!stickers.length) {
+      // fallback to neutral
+      const neutral = await getMoodStickers("neutral");
+      if (!neutral.length) return null;
+      return neutral[Math.floor(Math.random() * neutral.length)];
+    }
+    return stickers[Math.floor(Math.random() * stickers.length)];
+  } catch { return null; }
 }
 
 // Extract message text
@@ -379,6 +420,29 @@ async function handleAI(sock, msg) {
     await saveMood(from, mood);
     const reply = await getAIReply(from, text, senderName, mood);
     await sock.sendMessage(from, { text: reply }, { quoted: msg });
+
+    // 🎭 Randomly send a mood sticker (1 in 4 chance)
+    if (Math.random() < 0.25) {
+      try {
+        const sticker = await getRandomSticker(mood);
+        if (sticker) {
+          await sock.sendMessage(from, {
+            sticker: {
+              url: sticker.url,
+              directPath: sticker.directPath,
+              mediaKey: Buffer.from(sticker.mediaKey, "base64"),
+              fileEncSha256: Buffer.from(sticker.fileEncSha256, "base64"),
+              fileSha256: Buffer.from(sticker.fileSha256, "base64"),
+              fileLength: sticker.fileLength,
+              mimetype: "image/webp",
+            }
+          });
+        }
+      } catch (err) {
+        console.error("[sticker] Failed to send:", err.message);
+      }
+    }
+
     await sock.sendPresenceUpdate("paused", from);
 
     const responseTime = Date.now() - start;
@@ -441,6 +505,34 @@ async function onMessage(sock, botJid, botLid, { messages, type }) {
         continue;
       }
     }
+
+    // 🎭 Sticker capture mode
+    if (stickerCaptureMode && msg.message?.stickerMessage) {
+      try {
+        const sticker = msg.message.stickerMessage;
+        const id = require("crypto").randomUUID();
+        const stickerData = {
+          fileEncSha256: Buffer.from(sticker.fileEncSha256).toString("base64"),
+          fileSha256: Buffer.from(sticker.fileSha256).toString("base64"),
+          fileLength: sticker.fileLength,
+          mediaKey: Buffer.from(sticker.mediaKey).toString("base64"),
+          mimetype: sticker.mimetype || "image/webp",
+          directPath: sticker.directPath,
+          url: sticker.url,
+          capturedAt: Date.now(),
+          from,
+          isAnimated: sticker.isAnimated || false,
+        };
+        await saveStandbySticker(id, stickerData);
+        console.log(`[sticker] Captured sticker ${id} from ${from}`);
+        addToFeed({ type: "system", message: `Sticker captured from ${from}` });
+      } catch (err) {
+        console.error("[sticker] Failed to capture:", err.message);
+      }
+      continue;
+    }
+
+    if (!text) continue;
 
     console.log(`[msg] ${from} | ${msg.pushName}: ${text}`);
     await handleAI(sock, msg);
@@ -603,6 +695,93 @@ app.post("/api/blacklist/:chatId", authMiddleware, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// 🎭 Sticker API endpoints
+
+// Toggle capture mode
+app.post("/api/stickers/capture", authMiddleware, (req, res) => {
+  stickerCaptureMode = !stickerCaptureMode;
+  console.log(`[sticker] Capture mode ${stickerCaptureMode ? "ON" : "OFF"}`);
+  addToFeed({ type: "system", message: `Sticker capture mode ${stickerCaptureMode ? "enabled" : "disabled"}` });
+  res.json({ captureMode: stickerCaptureMode });
+});
+
+// Get capture mode status
+app.get("/api/stickers/status", authMiddleware, (req, res) => {
+  res.json({ captureMode: stickerCaptureMode });
+});
+
+// Get standby stickers
+app.get("/api/stickers/standby", authMiddleware, async (req, res) => {
+  try {
+    const stickers = await getStandbyStickers();
+    res.json(stickers);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Get mood stickers
+app.get("/api/stickers/mood/:mood", authMiddleware, async (req, res) => {
+  try {
+    const stickers = await getMoodStickers(req.params.mood);
+    res.json(stickers);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Classify sticker (move from standby to mood)
+app.post("/api/stickers/classify", authMiddleware, async (req, res) => {
+  try {
+    const { id, mood } = req.body;
+    const validMoods = ["happy", "neutral", "teasing", "annoyed", "affectionate"];
+    if (!validMoods.includes(mood)) return res.status(400).json({ error: "Invalid mood" });
+    const data = await redis.get(`sticker:standby:${id}`);
+    if (!data) return res.status(404).json({ error: "Sticker not found" });
+    await redis.set(`sticker:mood:${mood}:${id}`, data);
+    await redis.del(`sticker:standby:${id}`);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Delete specific sticker
+app.delete("/api/stickers/:type/:mood/:id", authMiddleware, async (req, res) => {
+  try {
+    const { type, mood, id } = req.params;
+    if (type === "standby") {
+      await redis.del(`sticker:standby:${id}`);
+    } else if (type === "mood") {
+      await redis.del(`sticker:mood:${mood}:${id}`);
+    }
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Clear standby
+app.delete("/api/stickers/standby/all", authMiddleware, async (req, res) => {
+  try {
+    const keys = await redis.keys("sticker:standby:*");
+    await Promise.all(keys.map(k => redis.del(k)));
+    res.json({ success: true, cleared: keys.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Clear mood directory
+app.delete("/api/stickers/mood/:mood/all", authMiddleware, async (req, res) => {
+  try {
+    const keys = await redis.keys(`sticker:mood:${req.params.mood}:*`);
+    await Promise.all(keys.map(k => redis.del(k)));
+    res.json({ success: true, cleared: keys.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Clear all stickers
+app.delete("/api/stickers/all", authMiddleware, async (req, res) => {
+  try {
+    const standby = await redis.keys("sticker:standby:*");
+    const mood = await redis.keys("sticker:mood:*");
+    const all = [...standby, ...mood];
+    await Promise.all(all.map(k => redis.del(k)));
+    res.json({ success: true, cleared: all.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // 📢 Announcement endpoint
