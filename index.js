@@ -488,25 +488,7 @@ async function onMessage(sock, botJid, botLid, { messages, type }) {
 
     const from = msg.key.remoteJid;
     const isGroup = from.endsWith("@g.us");
-    const text = getMessageText(msg).trim();
-    if (!text || text.length > 400) continue;
-    if (isGroup && !isBotMentionedOrReplied(msg, botJid, botLid)) continue;
-    if (await isBlacklisted(from)) {
-      console.log(`[blacklist] Ignored message from ${from}`);
-      continue;
-    }
-
-    // Also check individual sender in group chats
-    if (isGroup) {
-      const participant = msg.key.participant || "";
-      const userId = participant.replace(/:\d+/, "");
-      if (userId && await isBlacklisted(userId)) {
-        console.log(`[blacklist] Ignored group message from member ${userId}`);
-        continue;
-      }
-    }
-
-    // 🎭 Sticker capture mode
+    // 🎭 Sticker capture mode — must be before text check since stickers have no text
     if (stickerCaptureMode && msg.message?.stickerMessage) {
       try {
         const sticker = msg.message.stickerMessage;
@@ -532,7 +514,23 @@ async function onMessage(sock, botJid, botLid, { messages, type }) {
       continue;
     }
 
-    if (!text) continue;
+    const text = getMessageText(msg).trim();
+    if (!text || text.length > 400) continue;
+    if (isGroup && !isBotMentionedOrReplied(msg, botJid, botLid)) continue;
+    if (await isBlacklisted(from)) {
+      console.log(`[blacklist] Ignored message from ${from}`);
+      continue;
+    }
+
+    // Also check individual sender in group chats
+    if (isGroup) {
+      const participant = msg.key.participant || "";
+      const userId = participant.replace(/:\d+/, "");
+      if (userId && await isBlacklisted(userId)) {
+        console.log(`[blacklist] Ignored group message from member ${userId}`);
+        continue;
+      }
+    }
 
     console.log(`[msg] ${from} | ${msg.pushName}: ${text}`);
     await handleAI(sock, msg);
