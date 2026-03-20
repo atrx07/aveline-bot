@@ -119,6 +119,19 @@ async function saveMood(chatId, mood) {
   catch (err) { console.error("[redis] Failed to save mood:", err.message); }
 }
 
+// 🎭 Sticker enabled per chat
+async function isStickerEnabled(chatId) {
+  try {
+    const val = await redis.get(`stickers:enabled:${chatId}`);
+    return val === true || val === "true"; // default false
+  } catch { return true; }
+}
+
+async function setStickerEnabled(chatId, enabled) {
+  try { await redis.set(`stickers:enabled:${chatId}`, enabled); }
+  catch {}
+}
+
 // 💾 Save display name
 async function saveName(key, name) {
   try {
@@ -423,7 +436,8 @@ async function handleAI(sock, msg) {
     await sock.sendMessage(from, { text: reply }, { quoted: msg });
 
     // 🎭 Randomly send a mood sticker (1 in 4 chance)
-    if (Math.random() < 0.25) {
+    const stickerAllowed = await isStickerEnabled(from);
+    if (stickerAllowed && Math.random() < 0.25) {
       try {
         const sticker = await getRandomSticker(mood);
         if (sticker && sticker.base64) {
@@ -634,10 +648,12 @@ app.get("/api/chats", authMiddleware, async (req, res) => {
           const mBlacklisted = await isBlacklisted(uid);
           return { id: uid, name: mName || uid.split("@")[0], mood: mMood, blacklisted: mBlacklisted };
         }));
-        return { id, isGroup: true, name: name || null, messageCount: memory.length, mood, blacklisted, members };
+        const stickerEnabled = await isStickerEnabled(id);
+        return { id, isGroup: true, name: name || null, messageCount: memory.length, mood, blacklisted, stickerEnabled, members };
       }
 
-      return { id, isGroup: false, name: name || null, messageCount: memory.length, mood, blacklisted, members: [] };
+      const stickerEnabled = await isStickerEnabled(id);
+      return { id, isGroup: false, name: name || null, messageCount: memory.length, mood, blacklisted, stickerEnabled, members: [] };
     }));
     res.json(chats);
   } catch (err) {
@@ -785,6 +801,16 @@ app.delete("/api/stickers/:type/:mood/:id", authMiddleware, async (req, res) => 
       await redis.del(`sticker:mood:${mood}:${id}`);
     }
     res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 🎭 Toggle sticker for chat
+app.post("/api/stickers/toggle/:chatId", authMiddleware, async (req, res) => {
+  try {
+    const chatId = decodeURIComponent(req.params.chatId);
+    const current = await isStickerEnabled(chatId);
+    await setStickerEnabled(chatId, !current);
+    res.json({ enabled: !current });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
