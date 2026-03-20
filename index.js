@@ -38,6 +38,7 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  downloadContentFromMessage,
 } = require("@whiskeysockets/baileys");
 const { Boom } = require("@hapi/boom");
 const pino = require("pino");
@@ -425,17 +426,10 @@ async function handleAI(sock, msg) {
     if (Math.random() < 0.25) {
       try {
         const sticker = await getRandomSticker(mood);
-        if (sticker) {
+        if (sticker && sticker.base64) {
+          const stickerBuffer = Buffer.from(sticker.base64, "base64");
           await sock.sendMessage(from, {
-            sticker: {
-              url: sticker.url,
-              directPath: sticker.directPath,
-              mediaKey: Buffer.from(sticker.mediaKey, "base64"),
-              fileEncSha256: Buffer.from(sticker.fileEncSha256, "base64"),
-              fileSha256: Buffer.from(sticker.fileSha256, "base64"),
-              fileLength: sticker.fileLength,
-              mimetype: "image/webp",
-            }
+            sticker: stickerBuffer,
           });
         }
       } catch (err) {
@@ -493,20 +487,31 @@ async function onMessage(sock, botJid, botLid, { messages, type }) {
       try {
         const sticker = msg.message.stickerMessage;
         const id = require("crypto").randomUUID();
+
+        // Download the actual sticker binary
+        const stream = await downloadContentFromMessage(sticker, "sticker");
+        const chunks = [];
+        for await (const chunk of stream) chunks.push(chunk);
+        const buffer = Buffer.concat(chunks);
+        const base64Data = buffer.toString("base64");
+        const mimeType = sticker.isAnimated ? "image/webp" : "image/webp";
+
         const stickerData = {
+          base64: base64Data,
+          mimetype: mimeType,
+          isAnimated: sticker.isAnimated || false,
+          capturedAt: Date.now(),
+          from,
+          // Keep original metadata for sending
           fileEncSha256: Buffer.from(sticker.fileEncSha256).toString("base64"),
           fileSha256: Buffer.from(sticker.fileSha256).toString("base64"),
           fileLength: sticker.fileLength,
           mediaKey: Buffer.from(sticker.mediaKey).toString("base64"),
-          mimetype: sticker.mimetype || "image/webp",
           directPath: sticker.directPath,
           url: sticker.url,
-          capturedAt: Date.now(),
-          from,
-          isAnimated: sticker.isAnimated || false,
         };
         await saveStandbySticker(id, stickerData);
-        console.log(`[sticker] Captured sticker ${id} from ${from}`);
+        console.log(`[sticker] Captured and stored sticker ${id} from ${from}`);
         addToFeed({ type: "system", message: `Sticker captured from ${from}` });
       } catch (err) {
         console.error("[sticker] Failed to capture:", err.message);
@@ -543,9 +548,10 @@ app.use(express.json());
 
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
+  res.setHeader("Access-Control-Max-Age", "86400");
+  if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
 
@@ -740,7 +746,36 @@ app.post("/api/stickers/classify", authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Delete specific sticker
+// Clear all stickers (must be before wildcard routes)
+app.delete("/api/stickers/all", authMiddleware, async (req, res) => {
+  try {
+    const standby = await redis.keys("sticker:standby:*");
+    const mood = await redis.keys("sticker:mood:*");
+    const all = [...standby, ...mood];
+    await Promise.all(all.map(k => redis.del(k)));
+    res.json({ success: true, cleared: all.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Clear standby (must be before wildcard routes)
+app.delete("/api/stickers/standby/all", authMiddleware, async (req, res) => {
+  try {
+    const keys = await redis.keys("sticker:standby:*");
+    await Promise.all(keys.map(k => redis.del(k)));
+    res.json({ success: true, cleared: keys.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Clear mood directory (must be before wildcard routes)
+app.delete("/api/stickers/mood/:mood/all", authMiddleware, async (req, res) => {
+  try {
+    const keys = await redis.keys(`sticker:mood:${req.params.mood}:*`);
+    await Promise.all(keys.map(k => redis.del(k)));
+    res.json({ success: true, cleared: keys.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Delete specific sticker (wildcard — must be last)
 app.delete("/api/stickers/:type/:mood/:id", authMiddleware, async (req, res) => {
   try {
     const { type, mood, id } = req.params;
@@ -750,35 +785,6 @@ app.delete("/api/stickers/:type/:mood/:id", authMiddleware, async (req, res) => 
       await redis.del(`sticker:mood:${mood}:${id}`);
     }
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Clear standby
-app.delete("/api/stickers/standby/all", authMiddleware, async (req, res) => {
-  try {
-    const keys = await redis.keys("sticker:standby:*");
-    await Promise.all(keys.map(k => redis.del(k)));
-    res.json({ success: true, cleared: keys.length });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Clear mood directory
-app.delete("/api/stickers/mood/:mood/all", authMiddleware, async (req, res) => {
-  try {
-    const keys = await redis.keys(`sticker:mood:${req.params.mood}:*`);
-    await Promise.all(keys.map(k => redis.del(k)));
-    res.json({ success: true, cleared: keys.length });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Clear all stickers
-app.delete("/api/stickers/all", authMiddleware, async (req, res) => {
-  try {
-    const standby = await redis.keys("sticker:standby:*");
-    const mood = await redis.keys("sticker:mood:*");
-    const all = [...standby, ...mood];
-    await Promise.all(all.map(k => redis.del(k)));
-    res.json({ success: true, cleared: all.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
