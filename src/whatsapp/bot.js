@@ -11,6 +11,7 @@ const pino = require("pino");
 const qrcode = require("qrcode-terminal");
 const { groqClients } = require("../config");
 const { runtime, addToFeed } = require("../state");
+const { attachIdentityListeners } = require("../identity/service");
 const { onMessage } = require("./message-handler");
 
 let reconnecting = false;
@@ -23,11 +24,6 @@ async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState("./auth");
   const { version } = await fetchLatestBaileysVersion();
 
-  console.log("[debug] Key 1:", process.env.GROQ_API_KEY_1?.slice(0, 8));
-  console.log("[debug] Key 2:", process.env.GROQ_API_KEY_2?.slice(0, 8));
-  console.log("[debug] Key 3:", process.env.GROQ_API_KEY_3?.slice(0, 8));
-  console.log("[debug] Clients loaded:", groqClients.length);
-
   const sock = makeWASocket({
     version,
     auth: state,
@@ -36,6 +32,7 @@ async function startBot() {
   });
 
   runtime.botSocket = sock;
+  attachIdentityListeners(sock);
   let botLid = normalizedBotLid(sock);
 
   sock.ev.on("creds.update", saveCreds);
@@ -67,6 +64,7 @@ async function startBot() {
       console.log(`[AI] ${groqClients.length} Groq key(s) loaded`);
       console.log("Bot JID:", sock.user?.id);
       console.log("Bot LID:", botLid);
+      console.log("[identity] Explicit identity and debug pipeline attached.");
       addToFeed({ type: "system", message: "Bot connected to WhatsApp" });
     }
   });
