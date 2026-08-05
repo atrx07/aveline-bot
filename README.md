@@ -15,6 +15,7 @@ Aveline is an expressive WhatsApp bot powered by Groq LLMs. She adapts her mood 
 - **Group support** — responds only when mentioned or replied to
 - **Mood stickers** — captures, classifies, and sends stickers per chat mood
 - **Management API** — status, statistics, pause/resume, blacklist, memory controls, announcements, and sticker management
+- **Protected browser pairing** — renders WhatsApp's rotating QR cleanly at `/pair` instead of mangling it in Railway logs
 - **Railway-ready persistence** — keeps the complete Baileys auth directory on a mounted volume
 
 ---
@@ -24,7 +25,7 @@ Aveline is an expressive WhatsApp bot powered by Groq LLMs. She adapts her mood 
 - **Baileys** — WhatsApp Web connection
 - **Groq** — LLM inference
 - **Upstash Redis** — memory, mood, statistics, and sticker storage
-- **Express** — health endpoint and management API
+- **Express** — health endpoint, pairing page, and management API
 - **Railway** — hosting and persistent auth volume
 
 ---
@@ -72,7 +73,13 @@ npm run check
 npm start
 ```
 
-Scan the QR code in the terminal using **WhatsApp → Linked devices → Link a device**.
+Open:
+
+```text
+http://localhost:3000/pair
+```
+
+Your browser will request the `DASHBOARD_USER` and `DASHBOARD_PASS` values from `.env`. Scan the clean QR image using **WhatsApp → Linked devices → Link a device**.
 
 ---
 
@@ -99,7 +106,7 @@ DASHBOARD_PASS=your_dashboard_password
 DASHBOARD_TOKEN=a_long_random_token
 ```
 
-Do **not** add the old `CREDS_BASE64`, `RAILWAY_PROJECT_ID`, `RAILWAY_SERVICE_ID`, or `RAILWAY_TOKEN` variables. They belong to the retired single-file auth workflow and are ignored by the new bootstrap.
+Do **not** add the old `CREDS_BASE64`, `RAILWAY_PROJECT_ID`, `RAILWAY_SERVICE_ID`, or `RAILWAY_TOKEN` variables. They belong to the retired single-file auth workflow and are ignored by the bootstrap.
 
 ### 3. Attach the WhatsApp auth volume
 
@@ -109,13 +116,9 @@ Add a Railway volume to the Aveline service and mount it at:
 /app/auth
 ```
 
-Baileys uses multiple auth files. Persisting the whole directory prevents session loss when Railway redeploys or restarts the service.
+Baileys writes its auth files to `./auth`, which resolves to `/app/auth` on Railway. Persisting that complete directory prevents the linked-device session from disappearing during normal redeployments or restarts.
 
-### 4. Deploy and pair WhatsApp
-
-Deploy the service and open its logs. On the first launch, scan the displayed QR code from WhatsApp. The resulting session files are written to `/app/auth` and survive future deployments.
-
-### 5. Generate a public domain
+### 4. Generate a public domain
 
 Generate a Railway domain for the service. The root endpoint returns:
 
@@ -124,6 +127,39 @@ ok
 ```
 
 Use that endpoint as the basic deployment health check.
+
+### 5. Pair WhatsApp in the browser
+
+Open:
+
+```text
+https://YOUR-RAILWAY-DOMAIN/pair
+```
+
+The browser will show an HTTP Basic Authentication prompt. Enter the same `DASHBOARD_USER` and `DASHBOARD_PASS` configured in Railway.
+
+The page displays the latest WhatsApp QR as a proper PNG and refreshes automatically whenever WhatsApp rotates it. Scan it using **WhatsApp → Linked devices → Link a device**.
+
+After the connection opens:
+
+- the page changes to **Connected**
+- the live QR is cleared from application memory
+- the resulting Baileys auth files remain in `/app/auth` on the Railway volume
+- later deployments reconnect without another QR unless the linked device is revoked or the volume is wiped
+
+The deployment logs show only the protected pairing-page address; they no longer print the block-character QR.
+
+---
+
+## Pairing Page Security
+
+- `/pair` and `/pair/status` require the dashboard username and password through HTTP Basic Authentication
+- the current QR exists only in application memory
+- QR responses use no-cache headers
+- the QR is cleared after Aveline connects
+- the page has a restrictive Content Security Policy and cannot be framed by another site
+
+Treat the pairing page and dashboard credentials as sensitive. A live WhatsApp pairing QR authorizes a new linked device.
 
 ---
 
@@ -134,9 +170,10 @@ Use that endpoint as the basic deployment health check.
 - checks that the required Groq, Upstash, and dashboard variables exist
 - verifies that the auth directory is readable and writable
 - disables the retired `CREDS_BASE64` and Railway GraphQL credential-sync path
-- prevents Groq key prefixes from being printed by the legacy debug statements
+- captures Baileys' QR payload and renders it on the protected browser pairing page
+- prevents the terminal QR and Groq key prefixes from being printed in deployment logs
 
-Run the same validation locally with:
+Run the same syntax validation locally with:
 
 ```bash
 npm run check
