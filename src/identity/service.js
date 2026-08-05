@@ -108,7 +108,7 @@ function applyMentionSteps(text, steps, preserveBotName) {
 
   for (const step of ordered) {
     const replacement = step.isBot
-      ? (preserveBotName ? "@Aveline" : "")
+      ? "Aveline"
       : `@${step.resolvedName || "someone"}`;
     output = output.slice(0, step.start) + replacement + output.slice(step.end);
   }
@@ -236,11 +236,11 @@ async function resolveMentionSteps(sock, msg, rawText, mentionedJids, botAliases
       isBot,
       resolvedName: resolvedName || null,
       action: isBot
-        ? "remove Aveline trigger"
+        ? "replace Aveline trigger with display name"
         : resolvedName
           ? "replace internal mention with display name"
           : "replace unresolved internal mention with @someone",
-      replacement: isBot ? "" : `@${resolvedName || "someone"}`,
+      replacement: isBot ? "Aveline" : `@${resolvedName || "someone"}`,
     });
   }
 
