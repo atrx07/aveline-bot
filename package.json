@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node -r ./identity-layer.js bootstrap.js",
-    "check": "node --check identity-store.js && node --check identity-layer.js && node --check bootstrap.js && node --check index.js"
+    "check": "node scripts/check.js"
   },
   "engines": {
     "node": ">=20"
