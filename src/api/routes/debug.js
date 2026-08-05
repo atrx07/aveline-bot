@@ -3,6 +3,7 @@
 const {
   DEBUG_TRACE_LIMIT,
   getDebugTraces,
+  getDebugHealth,
   clearDebugTraces,
 } = require("../../state");
 
@@ -12,6 +13,7 @@ function registerDebugRoutes(app, authMiddleware) {
     res.setHeader("Cache-Control", "no-store");
     res.json({
       traces: getDebugTraces(limit),
+      health: getDebugHealth(),
       retention: {
         type: "memory-only",
         maxTraces: DEBUG_TRACE_LIMIT,
@@ -20,8 +22,13 @@ function registerDebugRoutes(app, authMiddleware) {
     });
   });
 
+  app.get("/api/debug/health", authMiddleware, (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.json(getDebugHealth());
+  });
+
   app.delete("/api/debug/traces", authMiddleware, (_req, res) => {
-    res.json({ success: true, cleared: clearDebugTraces() });
+    res.json({ success: true, cleared: clearDebugTraces(), health: getDebugHealth() });
   });
 }
 
