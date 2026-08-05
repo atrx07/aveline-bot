@@ -3,12 +3,14 @@
 const { groqClients } = require("../../config");
 const { stats, liveFeed, runtime, addToFeed } = require("../../state");
 const {
-  listChats,
   purgeAllMemory,
   purgeChatMemory,
-  saveMood,
-  toggleBlacklist,
 } = require("../../storage");
+const {
+  listCanonicalChats,
+  resetCanonicalMood,
+  toggleCanonicalBlacklist,
+} = require("../../canonical-members");
 const { login } = require("../auth");
 
 function registerDashboardRoutes(app, authMiddleware) {
@@ -41,7 +43,7 @@ function registerDashboardRoutes(app, authMiddleware) {
 
   app.get("/api/chats", authMiddleware, async (_req, res) => {
     try {
-      res.json(await listChats());
+      res.json(await listCanonicalChats());
     } catch (error) {
       res.status(500).json({ error: error.message });
     }
@@ -82,7 +84,7 @@ function registerDashboardRoutes(app, authMiddleware) {
 
   app.post("/api/mood/:chatId", authMiddleware, async (req, res) => {
     try {
-      await saveMood(decodeURIComponent(req.params.chatId), "neutral");
+      await resetCanonicalMood(decodeURIComponent(req.params.chatId));
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ error: error.message });
@@ -92,7 +94,7 @@ function registerDashboardRoutes(app, authMiddleware) {
   app.post("/api/blacklist/:chatId", authMiddleware, async (req, res) => {
     try {
       const chatId = decodeURIComponent(req.params.chatId);
-      const blacklisted = await toggleBlacklist(chatId);
+      const blacklisted = await toggleCanonicalBlacklist(chatId);
       addToFeed({
         type: "system",
         message: `${chatId} ${blacklisted ? "added to" : "removed from"} blacklist`,
