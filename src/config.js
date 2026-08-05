@@ -24,10 +24,15 @@ const groqClients = [
   .filter(Boolean)
   .map((apiKey) => new Groq({ apiKey }));
 
+const moodGroqClient = process.env.GROQ_API_KEY_4
+  ? new Groq({ apiKey: process.env.GROQ_API_KEY_4 })
+  : null;
+
 module.exports = {
   MEMORY_LIMIT,
   MODELS,
   VALID_MOODS,
   redis,
   groqClients,
+  moodGroqClient,
 };
