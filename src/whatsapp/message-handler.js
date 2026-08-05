@@ -6,8 +6,11 @@ const {
   stats,
   runtime,
   addToFeed,
+  createDebugTrace,
   mutateDebugTrace,
   updateDebugTrace,
+  noteDebugMessageSeen,
+  noteDebugPreprocessError,
 } = require("../state");
 const {
   saveName,
@@ -21,6 +24,13 @@ const {
 } = require("../storage");
 const { detectMood, getAIReply } = require("../ai/service");
 const {
+  prepareIncomingMessage,
+  emergencySanitize,
+  getRawText,
+  getContextInfo,
+  safeError,
+} = require("../identity/service");
+const {
   normalizeJid,
   getMessageText,
   getSenderName,
@@ -31,16 +41,100 @@ function optionalBase64(value) {
   return value ? Buffer.from(value).toString("base64") : null;
 }
 
-function traceIdFor(msg) {
-  return msg?.__avelineTraceId || null;
-}
-
 function markSkipped(traceId, reason, details = null) {
   updateDebugTrace(traceId, {
     status: "skipped",
     skipReason: reason,
     skipDetails: details,
     completedAt: Date.now(),
+  });
+}
+
+function messageKeySnapshot(msg) {
+  return {
+    remoteJid: msg?.key?.remoteJid || null,
+    remoteJidAlt: msg?.key?.remoteJidAlt || null,
+    participant: msg?.key?.participant || null,
+    participantAlt: msg?.key?.participantAlt || null,
+    participantLid: msg?.key?.participantLid || null,
+    participantPn: msg?.key?.participantPn || null,
+    senderLid: msg?.key?.senderLid || null,
+    senderPn: msg?.key?.senderPn || null,
+    fromMe: Boolean(msg?.key?.fromMe),
+  };
+}
+
+function createIncomingTrace(msg, upsertType) {
+  const rawText = getRawText(msg);
+  const contextInfo = getContextInfo(msg);
+  const chatId = msg?.key?.remoteJid || null;
+
+  noteDebugMessageSeen();
+  return createDebugTrace({
+    status: "received",
+    messageId: msg?.key?.id || null,
+    chat: {
+      id: chatId,
+      isGroup: Boolean(chatId?.endsWith("@g.us")),
+    },
+    sender: {
+      pushName: msg?.pushName || null,
+      participant: msg?.key?.participant || null,
+    },
+    whatsapp: {
+      rawText,
+      userVisibleEstimate: rawText,
+      messageType: Object.keys(msg?.message || {})[0] || "unknown",
+      contextInfo: {
+        mentionedJid: contextInfo?.mentionedJid || [],
+        quotedParticipant: contextInfo?.participant || null,
+        quotedRemoteJid: contextInfo?.remoteJid || null,
+      },
+      key: messageKeySnapshot(msg),
+    },
+    handler: { upsertType },
+    groqCalls: [],
+  });
+}
+
+function recordPreparedTrace(traceId, prepared) {
+  mutateDebugTrace(traceId, (trace) => {
+    trace.status = "parsed";
+    trace.chat = {
+      ...(trace.chat || {}),
+      id: prepared.chatId,
+      isGroup: prepared.isGroup,
+      groupName: prepared.groupName,
+    };
+    trace.sender = {
+      ...(trace.sender || {}),
+      senderAliases: prepared.senderAliases,
+      canonicalPerson: prepared.person ? {
+        id: prepared.person.id || null,
+        displayName: prepared.person.displayName || null,
+        aliases: prepared.person.aliases || [],
+        seenChats: prepared.person.seenChats || [],
+      } : null,
+    };
+    trace.whatsapp = {
+      ...(trace.whatsapp || {}),
+      rawText: prepared.rawText,
+      userVisibleEstimate: prepared.userVisibleEstimate,
+      messageType: prepared.messageType,
+      contextInfo: {
+        ...(trace.whatsapp?.contextInfo || {}),
+        mentionedJid: prepared.mentionedJids,
+      },
+    };
+    trace.parsing = {
+      botAliases: prepared.botAliases,
+      mentionSteps: prepared.mentionSteps,
+      expectedSanitizedText: prepared.sanitizedText,
+      actualSanitizedText: prepared.sanitizedText,
+      sanitizerMatchedExpectation: true,
+      identityPrompt: prepared.identityPrompt || null,
+      implementation: "explicit message-handler pipeline",
+    };
   });
 }
 
@@ -69,20 +163,18 @@ async function captureSticker(msg, from) {
   addToFeed({ type: "system", message: `Sticker captured from ${from}` });
 }
 
-async function learnConversationNames(sock, msg, from, isGroup, senderName) {
+async function learnConversationNames(msg, from, isGroup, senderName, prepared) {
   if (!isGroup) {
     if (senderName !== "there") await saveName(from, senderName);
     return { userId: null, groupName: null };
   }
 
-  let groupName = null;
-  try {
-    const metadata = await sock.groupMetadata(from);
-    groupName = metadata?.subject || null;
-    if (groupName) await saveName(from, groupName);
-  } catch {}
+  const groupName = prepared?.groupName || null;
+  if (groupName) await saveName(from, groupName);
 
-  const userId = normalizeJid(msg.key.participant);
+  const participant = msg.key.participantPn || msg.key.participantLid ||
+    msg.key.participantAlt || msg.key.participant;
+  const userId = normalizeJid(participant);
   if (userId) await saveGroupMember(from, userId, senderName);
   return { userId, groupName };
 }
@@ -104,14 +196,19 @@ async function maybeSendMoodSticker(sock, from, mood) {
   return null;
 }
 
-async function handleAI(sock, msg) {
-  const traceId = traceIdFor(msg);
+async function handleAI(sock, msg, { traceId, prepared }) {
   const from = msg.key.remoteJid;
   const isGroup = from.endsWith("@g.us");
   const senderName = getSenderName(msg);
-  const text = getMessageText(msg);
+  const text = prepared?.sanitizedText || getMessageText(msg);
   const startedAt = Date.now();
-  const { userId, groupName } = await learnConversationNames(sock, msg, from, isGroup, senderName);
+  const { userId, groupName } = await learnConversationNames(
+    msg,
+    from,
+    isGroup,
+    senderName,
+    prepared
+  );
 
   mutateDebugTrace(traceId, (trace) => {
     trace.status = "processing";
@@ -122,9 +219,14 @@ async function handleAI(sock, msg) {
       normalizedUserId: userId,
     };
     trace.handler = {
+      ...(trace.handler || {}),
       textReadByHandler: text,
       startedAt,
     };
+    if (trace.parsing) {
+      trace.parsing.actualSanitizedText = text;
+      trace.parsing.sanitizerMatchedExpectation = text === trace.parsing.expectedSanitizedText;
+    }
   });
 
   try {
@@ -134,7 +236,14 @@ async function handleAI(sock, msg) {
     await saveMood(from, mood);
     if (isGroup && userId) await saveMood(`${from}:${userId}`, mood);
 
-    const reply = await getAIReply(from, text, senderName, mood, traceId);
+    const reply = await getAIReply(
+      from,
+      text,
+      senderName,
+      mood,
+      traceId,
+      prepared?.identityPrompt || null
+    );
     await sock.sendMessage(from, { text: reply }, { quoted: msg });
     const stickerSent = await maybeSendMoodSticker(sock, from, mood);
 
@@ -175,10 +284,7 @@ async function handleAI(sock, msg) {
     updateDebugTrace(traceId, {
       status: "error",
       completedAt: Date.now(),
-      error: {
-        name: error?.name || "Error",
-        message: String(error?.message || error).slice(0, 2000),
-      },
+      error: safeError(error),
     });
     await sock.sendMessage(from, { text: "Oops 😅 AI couldn't respond right now." }, { quoted: msg });
   } finally {
@@ -190,20 +296,44 @@ async function onMessage(sock, botJid, botLid, { messages, type }) {
   if (type !== "notify" && type !== "append") return;
 
   for (const msg of messages) {
-    const traceId = traceIdFor(msg);
+    if (!msg?.message || msg.key?.fromMe || msg.key?.remoteJid === "status@broadcast") continue;
 
-    if (!msg.message) {
-      markSkipped(traceId, "Message contained no payload");
-      continue;
+    const traceId = createIncomingTrace(msg, type);
+    let prepared;
+
+    try {
+      prepared = await prepareIncomingMessage(sock, msg);
+      recordPreparedTrace(traceId, prepared);
+    } catch (error) {
+      noteDebugPreprocessError(error);
+      const emergency = emergencySanitize(msg);
+      prepared = {
+        ...emergency,
+        userVisibleEstimate: emergency.rawText,
+        contextInfo: getContextInfo(msg),
+        mentionedJids: [],
+        mentionSteps: [],
+        botAliases: [],
+        senderAliases: [],
+        person: null,
+        identityPrompt: null,
+        groupName: null,
+        isGroup: Boolean(msg.key.remoteJid?.endsWith("@g.us")),
+        chatId: msg.key.remoteJid,
+      };
+      updateDebugTrace(traceId, {
+        status: "preprocess-error",
+        error: safeError(error),
+        parsing: {
+          expectedSanitizedText: emergency.sanitizedText,
+          actualSanitizedText: emergency.sanitizedText,
+          sanitizerMatchedExpectation: true,
+          mentionSteps: [],
+          implementation: "emergency numeric-mention scrub",
+        },
+      });
     }
-    if (msg.key.fromMe) {
-      markSkipped(traceId, "Outgoing message from the bot account");
-      continue;
-    }
-    if (msg.key.remoteJid === "status@broadcast") {
-      markSkipped(traceId, "WhatsApp status broadcast");
-      continue;
-    }
+
     if (runtime.botPaused) {
       markSkipped(traceId, "Bot is paused");
       continue;
@@ -220,18 +350,17 @@ async function onMessage(sock, botJid, botLid, { messages, type }) {
         console.error("[sticker] Failed to capture:", error.message);
         updateDebugTrace(traceId, {
           status: "error",
-          error: { message: String(error?.message || error) },
+          error: safeError(error),
           completedAt: Date.now(),
         });
       }
       continue;
     }
 
-    const text = getMessageText(msg).trim();
+    const text = prepared.sanitizedText.trim();
     mutateDebugTrace(traceId, (trace) => {
       trace.handler = {
         ...(trace.handler || {}),
-        upsertType: type,
         textAtFilterStage: text,
         botJid,
         botLid,
@@ -263,7 +392,9 @@ async function onMessage(sock, botJid, botLid, { messages, type }) {
     }
 
     if (isGroup) {
-      const userId = normalizeJid(msg.key.participant);
+      const participant = msg.key.participantPn || msg.key.participantLid ||
+        msg.key.participantAlt || msg.key.participant;
+      const userId = normalizeJid(participant);
       if (userId && await isBlacklisted(userId)) {
         console.log(`[blacklist] Ignored group message from member ${userId}`);
         markSkipped(traceId, "Sender is blacklisted", { userId });
@@ -272,7 +403,7 @@ async function onMessage(sock, botJid, botLid, { messages, type }) {
     }
 
     console.log(`[msg] ${from} | ${msg.pushName}: ${text}`);
-    await handleAI(sock, msg);
+    await handleAI(sock, msg, { traceId, prepared });
   }
 }
 
