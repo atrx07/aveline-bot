@@ -6,6 +6,7 @@ const { authMiddleware } = require("./auth");
 const { registerDashboardRoutes } = require("./routes/dashboard");
 const { registerStickerRoutes } = require("./routes/stickers");
 const { registerAnnouncementRoutes } = require("./routes/announce");
+const { registerDebugRoutes } = require("./routes/debug");
 
 function createApp() {
   const app = express();
@@ -15,6 +16,7 @@ function createApp() {
   registerDashboardRoutes(app, authMiddleware);
   registerStickerRoutes(app, authMiddleware);
   registerAnnouncementRoutes(app, authMiddleware);
+  registerDebugRoutes(app, authMiddleware);
 
   app.get("/", (_req, res) => res.send("ok"));
   return app;
