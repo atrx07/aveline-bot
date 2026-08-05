@@ -16,13 +16,20 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-const groqClients = [
+const replyKeys = [
   process.env.GROQ_API_KEY_1,
   process.env.GROQ_API_KEY_2,
   process.env.GROQ_API_KEY_3,
-]
-  .filter(Boolean)
-  .map((apiKey) => new Groq({ apiKey }));
+];
+
+const groqKeySlots = replyKeys.map((apiKey, index) => ({
+  keyNumber: index + 1,
+  client: apiKey ? new Groq({ apiKey }) : null,
+}));
+
+const groqClients = groqKeySlots
+  .filter((slot) => slot.client)
+  .map((slot) => slot.client);
 
 const moodGroqClient = process.env.GROQ_API_KEY_4
   ? new Groq({ apiKey: process.env.GROQ_API_KEY_4 })
@@ -34,5 +41,6 @@ module.exports = {
   VALID_MOODS,
   redis,
   groqClients,
+  groqKeySlots,
   moodGroqClient,
 };
