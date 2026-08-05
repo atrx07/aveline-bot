@@ -104,7 +104,11 @@ function mutateDebugTrace(traceId, mutator) {
 
 function updateDebugTrace(traceId, patch = {}) {
   return mutateDebugTrace(traceId, (trace) => {
-    Object.assign(trace, patch);
+    const next = { ...patch };
+    if (patch.router && trace.router) {
+      next.router = { ...trace.router, ...patch.router };
+    }
+    Object.assign(trace, next);
   });
 }
 
