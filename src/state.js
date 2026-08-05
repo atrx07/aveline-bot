@@ -25,6 +25,23 @@ const runtime = {
   botPaused: false,
   botSocket: null,
   stickerCaptureMode: false,
+  debugPipeline: {
+    version: 2,
+    mode: "explicit-handler-pipeline",
+    active: true,
+    initializedAt: Date.now(),
+    identityListenersAttached: false,
+    identityAttachedAt: null,
+    messagesSeen: 0,
+    tracesCreated: 0,
+    preprocessErrors: 0,
+    lastMessageSeenAt: null,
+    lastTraceAt: null,
+    lastPreparedAt: null,
+    lastRawText: null,
+    lastParsedText: null,
+    lastIdentityError: null,
+  },
 };
 
 function addToFeed(entry) {
@@ -45,6 +62,19 @@ function getRateLimit(ip) {
   return entry;
 }
 
+function noteDebugMessageSeen() {
+  runtime.debugPipeline.messagesSeen++;
+  runtime.debugPipeline.lastMessageSeenAt = Date.now();
+}
+
+function noteDebugPreprocessError(error) {
+  runtime.debugPipeline.preprocessErrors++;
+  runtime.debugPipeline.lastIdentityError = {
+    name: error?.name || "Error",
+    message: String(error?.message || error || "Unknown error").slice(0, 2000),
+  };
+}
+
 function createDebugTrace(seed = {}) {
   const now = Date.now();
   const trace = {
@@ -57,6 +87,8 @@ function createDebugTrace(seed = {}) {
 
   debugTraces.unshift(trace);
   if (debugTraces.length > DEBUG_TRACE_LIMIT) debugTraces.length = DEBUG_TRACE_LIMIT;
+  runtime.debugPipeline.tracesCreated++;
+  runtime.debugPipeline.lastTraceAt = now;
   return trace.id;
 }
 
@@ -95,6 +127,28 @@ function getDebugTraces(limit = DEBUG_TRACE_LIMIT) {
   return debugTraces.slice(0, safeLimit);
 }
 
+function getDebugHealth() {
+  const pipeline = runtime.debugPipeline;
+  return {
+    ...pipeline,
+    traceCount: debugTraces.length,
+    healthy: Boolean(
+      pipeline.active &&
+      pipeline.identityListenersAttached &&
+      pipeline.tracesCreated <= pipeline.messagesSeen
+    ),
+    diagnosis: !pipeline.active
+      ? "debug pipeline disabled"
+      : !pipeline.identityListenersAttached
+        ? "identity listeners are not attached to the active WhatsApp socket"
+        : pipeline.messagesSeen > 0 && pipeline.tracesCreated === 0
+          ? "messages are reaching the handler but traces are not being created"
+          : pipeline.preprocessErrors > 0
+            ? "pipeline active with preprocessing errors"
+            : "explicit tracing pipeline active",
+  };
+}
+
 function clearDebugTraces() {
   const cleared = debugTraces.length;
   debugTraces.length = 0;
@@ -110,11 +164,14 @@ module.exports = {
   runtime,
   addToFeed,
   getRateLimit,
+  noteDebugMessageSeen,
+  noteDebugPreprocessError,
   createDebugTrace,
   mutateDebugTrace,
   updateDebugTrace,
   appendGroqCall,
   finishGroqCall,
   getDebugTraces,
+  getDebugHealth,
   clearDebugTraces,
 };
