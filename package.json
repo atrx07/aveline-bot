@@ -4,7 +4,7 @@
   "description": "A WhatsApp AI chatbot with personality, memory, mood, and persistent Railway deployment support",
   "main": "index.js",
   "scripts": {
-    "start": "node -r ./identity-layer.js bootstrap.js",
+    "start": "node bootstrap.js",
     "check": "node scripts/check.js"
   },
   "engines": {
