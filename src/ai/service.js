@@ -1,7 +1,13 @@
 "use strict";
 
 const crypto = require("crypto");
-const { groqClients, MEMORY_LIMIT, MODELS, VALID_MOODS } = require("../config");
+const {
+  groqClients,
+  moodGroqClient,
+  MEMORY_LIMIT,
+  MODELS,
+  VALID_MOODS,
+} = require("../config");
 const {
   stats,
   mutateDebugTrace,
@@ -116,8 +122,10 @@ async function tracedGroqCall({
 }
 
 async function detectMood(text, traceId = null) {
-  if (!groqClients.length) {
-    updateDebugTrace(traceId, { mood: { input: text, result: "neutral", reason: "no Groq clients" } });
+  if (!moodGroqClient) {
+    updateDebugTrace(traceId, {
+      mood: { input: text, result: "neutral", reason: "GROQ_API_KEY_4 is not configured" },
+    });
     return "neutral";
   }
 
@@ -139,8 +147,8 @@ Return ONLY the JSON. No markdown, no extra text.`,
 
   try {
     const completion = await tracedGroqCall({
-      client: groqClients[0],
-      clientNumber: 1,
+      client: moodGroqClient,
+      clientNumber: 4,
       request,
       traceId,
       purpose: "mood",
