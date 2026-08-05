@@ -3,6 +3,17 @@
 const { redis } = require("./config");
 const { stats } = require("./state");
 
+function splitMemberMoodScope(scope) {
+  const marker = "@g.us:";
+  const index = typeof scope === "string" ? scope.indexOf(marker) : -1;
+  if (index < 0) return null;
+
+  return {
+    groupId: scope.slice(0, index + "@g.us".length),
+    memberId: scope.slice(index + marker.length),
+  };
+}
+
 async function loadMemory(chatId) {
   try {
     const data = await redis.get(`memory:${chatId}`);
@@ -22,6 +33,24 @@ async function saveMemory(chatId, memory) {
 
 async function loadMood(chatId) {
   try {
+    const memberScope = splitMemberMoodScope(chatId);
+    if (memberScope) {
+      const { resolveIdentity } = require("./canonical-members");
+      const identity = await resolveIdentity(memberScope.memberId);
+      const canonicalId = identity.canonicalId || memberScope.memberId;
+      const canonicalMood = await redis.get(`mood:${memberScope.groupId}:${canonicalId}`);
+      if (canonicalMood) return canonicalMood;
+
+      if (canonicalId !== memberScope.memberId) {
+        const legacyMood = await redis.get(`mood:${chatId}`);
+        if (legacyMood) {
+          await redis.set(`mood:${memberScope.groupId}:${canonicalId}`, legacyMood).catch(() => {});
+          return legacyMood;
+        }
+      }
+      return "neutral";
+    }
+
     return (await redis.get(`mood:${chatId}`)) || "neutral";
   } catch {
     return "neutral";
@@ -30,6 +59,15 @@ async function loadMood(chatId) {
 
 async function saveMood(chatId, mood) {
   try {
+    const memberScope = splitMemberMoodScope(chatId);
+    if (memberScope) {
+      const { resolveIdentity } = require("./canonical-members");
+      const identity = await resolveIdentity(memberScope.memberId);
+      const canonicalId = identity.canonicalId || memberScope.memberId;
+      await redis.set(`mood:${memberScope.groupId}:${canonicalId}`, mood);
+      return;
+    }
+
     await redis.set(`mood:${chatId}`, mood);
   } catch (error) {
     console.error("[redis] Failed to save mood:", error.message);
@@ -58,32 +96,49 @@ async function saveName(key, name) {
   } catch {}
 }
 
-async function saveGroupMember(groupId, userId, name) {
+async function saveGroupMember(groupId, userId, name, personHint = null) {
   try {
-    if (name) await redis.set(`name:${groupId}:${userId}`, name);
-    const existing = await redis.get(`members:${groupId}`);
-    const members = Array.isArray(existing) ? existing : [];
-    if (!members.includes(userId)) {
-      members.push(userId);
-      await redis.set(`members:${groupId}`, members);
-    }
-  } catch {}
+    const { saveCanonicalGroupMember } = require("./canonical-members");
+    return await saveCanonicalGroupMember(groupId, userId, name, personHint);
+  } catch (error) {
+    console.error("[members] Canonical save failed, using legacy member ID:", error.message);
+    try {
+      if (name) await redis.set(`name:${groupId}:${userId}`, name);
+      const existing = await redis.get(`members:${groupId}`);
+      const members = Array.isArray(existing) ? existing : [];
+      if (!members.includes(userId)) {
+        members.push(userId);
+        await redis.set(`members:${groupId}`, members);
+      }
+    } catch {}
+    return userId;
+  }
 }
 
 async function isBlacklisted(chatId) {
   try {
-    const value = await redis.get(`blacklist:${chatId}`);
-    return value === true || value === "true";
+    const { isCanonicalBlacklisted } = require("./canonical-members");
+    return await isCanonicalBlacklisted(chatId);
   } catch {
-    return false;
+    try {
+      const value = await redis.get(`blacklist:${chatId}`);
+      return value === true || value === "true";
+    } catch {
+      return false;
+    }
   }
 }
 
 async function toggleBlacklist(chatId) {
-  const current = await isBlacklisted(chatId);
-  if (current) await redis.del(`blacklist:${chatId}`);
-  else await redis.set(`blacklist:${chatId}`, true);
-  return !current;
+  try {
+    const { toggleCanonicalBlacklist } = require("./canonical-members");
+    return await toggleCanonicalBlacklist(chatId);
+  } catch {
+    const current = await isBlacklisted(chatId);
+    if (current) await redis.del(`blacklist:${chatId}`);
+    else await redis.set(`blacklist:${chatId}`, true);
+    return !current;
+  }
 }
 
 async function getAllChatIds() {
@@ -118,18 +173,21 @@ async function saveStats() {
 }
 
 async function purgeAllMemory() {
-  const chatIds = await getAllChatIds();
-  await Promise.all(chatIds.flatMap((id) => [
-    redis.del(`memory:${id}`),
-    redis.del(`mood:${id}`),
-  ]));
-  return chatIds.length;
+  const [memoryKeys, moodKeys] = await Promise.all([
+    redis.keys("memory:*").catch(() => []),
+    redis.keys("mood:*").catch(() => []),
+  ]);
+  const keys = [...memoryKeys, ...moodKeys];
+  await Promise.all(keys.map((key) => redis.del(key)));
+  return memoryKeys.length;
 }
 
 async function purgeChatMemory(chatId) {
+  const memberMoodKeys = await redis.keys(`mood:${chatId}:*`).catch(() => []);
   await Promise.all([
     redis.del(`memory:${chatId}`),
     redis.del(`mood:${chatId}`),
+    ...memberMoodKeys.map((key) => redis.del(key)),
   ]);
 }
 
