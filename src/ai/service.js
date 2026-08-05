@@ -3,6 +3,7 @@
 const crypto = require("crypto");
 const {
   groqClients,
+  groqKeySlots,
   moodGroqClient,
   MEMORY_LIMIT,
   MODELS,
@@ -17,6 +18,11 @@ const {
 } = require("../state");
 const { loadMemory, saveMemory, saveStats } = require("../storage");
 const { buildSystemPrompt } = require("./prompt");
+const {
+  getPairEligibility,
+  markPairFailure,
+  markPairSuccess,
+} = require("./router-health");
 
 function safeError(error) {
   return {
@@ -61,6 +67,14 @@ function injectIdentityPrompt(messages, identityPrompt) {
   return messages.map((message, index) => index === 0 && typeof message?.content === "string"
     ? { ...message, content: `${message.content}\n\n${identityPrompt}` }
     : message);
+}
+
+function appendRouterEvent(traceId, field, event) {
+  mutateDebugTrace(traceId, (trace) => {
+    trace.router = trace.router || { skipped: [], attempted: [], selected: null };
+    trace.router[field] = Array.isArray(trace.router[field]) ? trace.router[field] : [];
+    trace.router[field].push(event);
+  });
 }
 
 async function createWithTimeout(client, request, timeoutMs = 4000) {
@@ -174,53 +188,114 @@ async function callAI(messages, traceId = null, identityPrompt = null) {
   const finalMessages = injectIdentityPrompt(messages, identityPrompt)
     .map((message) => ({ ...message, content: sanitizeInternalMentions(message.content) }));
 
+  mutateDebugTrace(traceId, (trace) => {
+    trace.router = {
+      order: MODELS.map((model) => ({ model, keys: [1, 2, 3] })),
+      skipped: [],
+      attempted: [],
+      selected: null,
+    };
+  });
+
   for (const model of MODELS) {
-    for (let keyIndex = 0; keyIndex < groqClients.length; keyIndex++) {
-      const client = groqClients[keyIndex];
+    for (const slot of groqKeySlots) {
+      const { keyNumber, client } = slot;
+      if (!client) {
+        appendRouterEvent(traceId, "skipped", {
+          keyNumber,
+          model,
+          reason: "not_configured",
+          at: Date.now(),
+        });
+        continue;
+      }
+
+      const availability = await getPairEligibility(keyNumber, model);
+      if (!availability.eligible) {
+        appendRouterEvent(traceId, "skipped", {
+          keyNumber,
+          model,
+          reason: availability.reason,
+          remainingMs: availability.remainingMs,
+          cooldownUntil: availability.state.cooldownUntil || null,
+          at: Date.now(),
+        });
+        console.log(`[router] Skipping key ${keyNumber} / ${model}: ${availability.reason}`);
+        continue;
+      }
+
       const request = {
         model,
         messages: finalMessages,
         max_tokens: 300,
         temperature: 0.85,
       };
+      const attemptStartedAt = Date.now();
 
       try {
-        console.log(`[AI] Trying key ${keyIndex + 1} / model: ${model}`);
+        console.log(`[AI] Trying key ${keyNumber} / model: ${model}`);
         const completion = await tracedGroqCall({
           client,
-          clientNumber: keyIndex + 1,
+          clientNumber: keyNumber,
           request,
           traceId,
           purpose: "reply",
         });
 
+        await markPairSuccess(keyNumber, model);
+        appendRouterEvent(traceId, "attempted", {
+          keyNumber,
+          model,
+          result: "success",
+          durationMs: Date.now() - attemptStartedAt,
+        });
+
         stats.modelUsage[model] = (stats.modelUsage[model] || 0) + 1;
-        stats.keyUsage[`key${keyIndex + 1}`] = (stats.keyUsage[`key${keyIndex + 1}`] || 0) + 1;
-        console.log(`[AI] Response from key ${keyIndex + 1} / model: ${model}`);
+        stats.keyUsage[`key${keyNumber}`] = (stats.keyUsage[`key${keyNumber}`] || 0) + 1;
+        console.log(`[AI] Response from key ${keyNumber} / model: ${model}`);
 
         const output = sanitizeInternalMentions(completion.choices[0].message.content.trim());
         updateDebugTrace(traceId, {
+          router: {
+            ...(undefined),
+          },
           selectedGroqResult: {
             model,
-            clientNumber: keyIndex + 1,
+            clientNumber: keyNumber,
             output,
           },
         });
+        mutateDebugTrace(traceId, (trace) => {
+          trace.router = trace.router || {};
+          trace.router.selected = { keyNumber, model, at: Date.now() };
+        });
         return output;
       } catch (error) {
+        const failure = await markPairFailure(keyNumber, model, error);
+        appendRouterEvent(traceId, "attempted", {
+          keyNumber,
+          model,
+          result: "error",
+          failureType: failure.type,
+          reason: failure.reason,
+          cooldownMs: failure.durationMs,
+          durationMs: Date.now() - attemptStartedAt,
+          error: safeError(error),
+        });
+
         if (error?.status === 429) {
           stats.rateLimitHits++;
-          console.log(`[AI] Key ${keyIndex + 1} rate limited on ${model} → trying next`);
+          console.log(`[AI] Key ${keyNumber} rate limited on ${model} → cooldown + next pair`);
         } else if (error.message === "timeout") {
-          console.log(`[AI] Key ${keyIndex + 1} timed out on ${model} → trying next`);
+          console.log(`[AI] Key ${keyNumber} timed out on ${model} → short cooldown + next pair`);
         } else {
-          console.log(`[AI] Key ${keyIndex + 1} error on ${model}:`, error.message || error);
+          console.log(`[AI] Key ${keyNumber} error on ${model}:`, error.message || error);
         }
       }
     }
 
     const nextModel = MODELS[MODELS.indexOf(model) + 1];
-    if (nextModel) console.log(`[AI] All keys exhausted for ${model} → switching to ${nextModel}`);
+    if (nextModel) console.log(`[AI] No available success for ${model} → switching to ${nextModel}`);
   }
 
   await saveStats();
