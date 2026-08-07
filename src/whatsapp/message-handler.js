@@ -22,7 +22,13 @@ const {
   isBlacklisted,
   saveStats,
 } = require("../storage");
-const { detectMood, getAIReply } = require("../ai/service");
+const { evaluateSystemDecision, getAIReply } = require("../ai/service");
+const {
+  loadRelationship,
+  applyRelationshipDecision,
+  publicRelationship,
+} = require("../relationship/service");
+const { resolveIdentity } = require("../canonical-members");
 const {
   prepareIncomingMessage,
   emergencySanitize,
@@ -175,8 +181,19 @@ async function learnConversationNames(msg, from, isGroup, senderName, prepared) 
   const participant = msg.key.participantPn || msg.key.participantLid ||
     msg.key.participantAlt || msg.key.participant;
   const userId = normalizeJid(participant);
-  if (userId) await saveGroupMember(from, userId, senderName);
+  if (userId) await saveGroupMember(from, userId, senderName, prepared?.person || null);
   return { userId, groupName };
+}
+
+async function canonicalPersonId(prepared, fallbackIdentifier) {
+  if (prepared?.person?.id) return prepared.person.id;
+  if (!fallbackIdentifier) return null;
+  try {
+    const identity = await resolveIdentity(fallbackIdentifier, prepared?.person || null);
+    return identity.id || null;
+  } catch {
+    return null;
+  }
 }
 
 async function maybeSendMoodSticker(sock, from, mood) {
@@ -209,6 +226,7 @@ async function handleAI(sock, msg, { traceId, prepared }) {
     senderName,
     prepared
   );
+  const personId = await canonicalPersonId(prepared, userId || from);
 
   mutateDebugTrace(traceId, (trace) => {
     trace.status = "processing";
@@ -217,6 +235,7 @@ async function handleAI(sock, msg, { traceId, prepared }) {
       ...(trace.sender || {}),
       displayNameUsed: senderName,
       normalizedUserId: userId,
+      canonicalPersonId: personId,
     };
     trace.handler = {
       ...(trace.handler || {}),
@@ -232,7 +251,42 @@ async function handleAI(sock, msg, { traceId, prepared }) {
   try {
     await sock.sendPresenceUpdate("composing", from);
 
-    const mood = await detectMood(text, traceId);
+    const relationshipBefore = personId ? await loadRelationship(personId) : null;
+    const systemDecision = await evaluateSystemDecision({
+      chatId: from,
+      text,
+      name: senderName,
+      relationship: relationshipBefore,
+      traceId,
+    });
+    const mood = systemDecision.mood;
+
+    const relationshipResult = personId
+      ? await applyRelationshipDecision(personId, systemDecision.relationship)
+      : { state: relationshipBefore, transition: null, applied: false, evaluation: null };
+    const relationship = relationshipResult.state || relationshipBefore;
+
+    mutateDebugTrace(traceId, (trace) => {
+      trace.relationship = {
+        personId,
+        before: publicRelationship(relationshipBefore),
+        decision: systemDecision.relationship,
+        evaluation: relationshipResult.evaluation || null,
+        transition: relationshipResult.transition || null,
+        after: publicRelationship(relationship),
+      };
+    });
+
+    if (relationshipResult.transition) {
+      console.log(
+        `[relationship] ${senderName}: ${relationshipResult.transition.from} → ${relationshipResult.transition.to}`
+      );
+      addToFeed({
+        type: "system",
+        message: `${senderName} relationship changed: ${relationshipResult.transition.from} → ${relationshipResult.transition.to}`,
+      });
+    }
+
     await saveMood(from, mood);
     if (isGroup && userId) await saveMood(`${from}:${userId}`, mood);
 
@@ -241,6 +295,7 @@ async function handleAI(sock, msg, { traceId, prepared }) {
       text,
       senderName,
       mood,
+      relationship,
       traceId,
       prepared?.identityPrompt || null
     );
@@ -263,6 +318,7 @@ async function handleAI(sock, msg, { traceId, prepared }) {
       text: text.slice(0, 200),
       reply: reply.slice(0, 200),
       mood,
+      relationship: relationship?.status || null,
       responseTime,
     });
 
