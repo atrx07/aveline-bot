@@ -2,9 +2,8 @@
 
 const crypto = require("crypto");
 const {
-  groqClients,
   groqKeySlots,
-  moodGroqClient,
+  decisionGroqClient,
   MEMORY_LIMIT,
   MODELS,
   VALID_MOODS,
@@ -18,6 +17,10 @@ const {
 } = require("../state");
 const { loadMemory, saveMemory, saveStats } = require("../storage");
 const { buildSystemPrompt } = require("./prompt");
+const {
+  RELATIONSHIP_STATUSES,
+  RELATIONSHIP_GRAPH,
+} = require("../relationship/service");
 const {
   getPairEligibility,
   markPairFailure,
@@ -135,42 +138,160 @@ async function tracedGroqCall({
   }
 }
 
-async function detectMood(text, traceId = null) {
-  if (!moodGroqClient) {
+function zeroRelationshipDecision(status, reason) {
+  return {
+    recommended_status: status || "stranger",
+    change_strength: "none",
+    confidence: 0,
+    deltas: {
+      familiarity: 0,
+      trust: 0,
+      affection: 0,
+      respect: 0,
+      hostility: 0,
+    },
+    reason,
+  };
+}
+
+function parseJsonObject(raw) {
+  const text = String(raw || "").trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end < start) throw new Error("system decision returned no JSON object");
+  return JSON.parse(text.slice(start, end + 1));
+}
+
+function compactRelationshipEvidence(relationship) {
+  return (relationship?.recentEvidence || []).slice(-6).map((entry) => ({
+    at: entry.at,
+    fromStatus: entry.fromStatus,
+    recommendedStatus: entry.recommendedStatus,
+    strength: entry.strength,
+    confidence: entry.confidence,
+    reason: entry.reason,
+  }));
+}
+
+async function evaluateSystemDecision({
+  chatId,
+  text,
+  name,
+  relationship,
+  traceId = null,
+}) {
+  const currentStatus = RELATIONSHIP_STATUSES.includes(relationship?.status)
+    ? relationship.status
+    : "stranger";
+  const fallback = {
+    mood: "neutral",
+    relationship: zeroRelationshipDecision(currentStatus, "system decision unavailable"),
+  };
+
+  if (!decisionGroqClient) {
     updateDebugTrace(traceId, {
       mood: { input: text, result: "neutral", reason: "GROQ_API_KEY_4 is not configured" },
+      systemDecision: { result: fallback, reason: "GROQ_API_KEY_4 is not configured" },
     });
-    return "neutral";
+    return fallback;
   }
+
+  const loadedMemory = chatId ? await loadMemory(chatId) : [];
+  const recentConversation = sanitizeMemory(loadedMemory).memory.slice(-8).map((entry) => ({
+    role: entry.role,
+    content: String(entry.content || "").slice(0, 800),
+  }));
+  const allowedNext = [currentStatus, ...(RELATIONSHIP_GRAPH[currentStatus] || [])];
 
   const request = {
     model: MODELS[0],
+    temperature: 0.2,
+    max_tokens: 350,
     messages: [
       {
         role: "system",
-        content: `Analyze the message and return ONLY a raw JSON object with:
-- "mood": one of "happy", "neutral", "teasing", "annoyed", "affectionate"
+        content: `You are Aveline's private SYSTEM DECISION BRAIN. You do not write the conversational reply.
+Your job is to judge (1) Aveline's immediate mood toward the person and (2) slow relationship development.
 
-Example: {"mood":"happy"}
-Return ONLY the JSON. No markdown, no extra text.`,
+Return ONLY one raw JSON object with exactly this shape:
+{"mood":"neutral","relationship":{"recommended_status":"stranger","change_strength":"none","confidence":0.8,"deltas":{"familiarity":0,"trust":0,"affection":0,"respect":0,"hostility":0},"reason":"brief evidence-based reason"}}
+
+Mood MUST be one of: ${VALID_MOODS.join(", ")}.
+Relationship status MUST be one of: ${RELATIONSHIP_STATUSES.join(", ")}.
+change_strength MUST be one of: none, minor, significant, major.
+confidence MUST be a number from 0 to 1.
+Each delta MUST be an integer from -12 to 12.
+
+STRICT RELATIONSHIP RULES:
+- Mood is fast and may change on a single message.
+- Relationship is deliberately slow and persistent. NEVER promote or demote it merely because one ordinary message is nice, rude, flirty, dry, or annoying.
+- Normal conversation usually uses change_strength minor or none. Familiarity can creep upward slowly through repeated interaction.
+- significant means the conversation contains meaningful evidence that should influence lasting trust, affection, respect, hostility, or closeness.
+- major is reserved for genuinely heavy events: severe betrayal/abuse, major reconciliation, explicit deeply personal trust, sustained mutual romantic commitment, or similarly decisive moments.
+- A single insult can make mood annoyed without making someone an enemy.
+- A single compliment or heart emoji can make mood happy/affectionate without making someone a close friend or romantic interest.
+- Romantic states require clear repeated reciprocal context. "partner" requires established mutual relationship context, never mere flirting.
+- Negative states require repeated harmful patterns or unusually severe evidence.
+- Recommend the CURRENT status unless there is real evidence for a transition.
+- You may recommend ONLY the current status or one of the allowed next statuses supplied in the input. Never jump across the graph.
+- Deltas describe this interaction only. Keep them small for ordinary conversation.
+- reason must be short, concrete, and about interaction evidence, not hidden policy.
+
+Return JSON only. No markdown, commentary, or reply text.`,
       },
-      { role: "user", content: sanitizeInternalMentions(text) },
+      {
+        role: "user",
+        content: JSON.stringify({
+          person_name: name || "Unknown",
+          current_relationship: {
+            status: currentStatus,
+            metrics: relationship?.metrics || null,
+            interaction_count: relationship?.interactionCount || 0,
+            pending_transition: relationship?.pendingTransition || null,
+          },
+          allowed_next_statuses: allowedNext,
+          recent_relationship_evidence: compactRelationshipEvidence(relationship),
+          recent_conversation: recentConversation,
+          latest_message: sanitizeInternalMentions(text),
+        }),
+      },
     ],
-    max_tokens: 15,
   };
 
   try {
     const completion = await tracedGroqCall({
-      client: moodGroqClient,
+      client: decisionGroqClient,
       clientNumber: 4,
       request,
       traceId,
-      purpose: "mood",
+      purpose: "system-decision",
     });
     const rawOutput = completion.choices[0].message.content.trim();
-    const parsed = JSON.parse(rawOutput);
-    const result = VALID_MOODS.includes(parsed.mood) ? parsed.mood : "neutral";
-    updateDebugTrace(traceId, { mood: { input: text, rawOutput, result } });
+    const parsed = parseJsonObject(rawOutput);
+    const mood = VALID_MOODS.includes(parsed?.mood) ? parsed.mood : "neutral";
+    const relation = parsed?.relationship && typeof parsed.relationship === "object"
+      ? parsed.relationship
+      : zeroRelationshipDecision(currentStatus, "invalid relationship decision payload");
+
+    if (!allowedNext.includes(relation.recommended_status)) {
+      relation.recommended_status = currentStatus;
+      relation.change_strength = "none";
+      relation.reason = "invalid graph transition rejected";
+    }
+
+    const result = { mood, relationship: relation };
+    updateDebugTrace(traceId, {
+      mood: { input: text, rawOutput, result: mood },
+      systemDecision: {
+        input: {
+          currentRelationship: currentStatus,
+          allowedNext,
+          recentConversationCount: recentConversation.length,
+        },
+        rawOutput,
+        result,
+      },
+    });
     return result;
   } catch (error) {
     updateDebugTrace(traceId, {
@@ -179,9 +300,24 @@ Return ONLY the JSON. No markdown, no extra text.`,
         result: "neutral",
         error: String(error?.message || error).slice(0, 2000),
       },
+      systemDecision: {
+        result: fallback,
+        error: String(error?.message || error).slice(0, 2000),
+      },
     });
-    return "neutral";
+    return fallback;
   }
+}
+
+async function detectMood(text, traceId = null) {
+  const result = await evaluateSystemDecision({
+    chatId: null,
+    text,
+    name: "Unknown",
+    relationship: null,
+    traceId,
+  });
+  return result.mood;
 }
 
 async function callAI(messages, traceId = null, identityPrompt = null) {
@@ -256,9 +392,6 @@ async function callAI(messages, traceId = null, identityPrompt = null) {
 
         const output = sanitizeInternalMentions(completion.choices[0].message.content.trim());
         updateDebugTrace(traceId, {
-          router: {
-            ...(undefined),
-          },
           selectedGroqResult: {
             model,
             clientNumber: keyNumber,
@@ -311,7 +444,15 @@ async function callAI(messages, traceId = null, identityPrompt = null) {
   return fallback;
 }
 
-async function getAIReply(chatId, text, name, mood, traceId = null, identityPrompt = null) {
+async function getAIReply(
+  chatId,
+  text,
+  name,
+  mood,
+  relationship,
+  traceId = null,
+  identityPrompt = null
+) {
   const loaded = await loadMemory(chatId);
   const sanitized = sanitizeMemory(loaded);
   let memory = sanitized.memory;
@@ -323,7 +464,7 @@ async function getAIReply(chatId, text, name, mood, traceId = null, identityProm
   if (memory.length > MEMORY_LIMIT) memory = memory.slice(-MEMORY_LIMIT);
 
   const messagesBeforeIdentityInjection = [
-    { role: "system", content: buildSystemPrompt(mood) },
+    { role: "system", content: buildSystemPrompt(mood, relationship) },
     ...memory,
   ];
 
@@ -333,6 +474,12 @@ async function getAIReply(chatId, text, name, mood, traceId = null, identityProm
       speakerName: name,
       parsedText: safeText,
       mood,
+      relationship: relationship ? {
+        status: relationship.status,
+        metrics: relationship.metrics,
+        interactionCount: relationship.interactionCount,
+        pendingTransition: relationship.pendingTransition,
+      } : null,
       memoryBefore,
       staleNumericMentionsRemoved: sanitized.changed,
       messagesBeforeIdentityInjection,
@@ -357,4 +504,9 @@ async function getAIReply(chatId, text, name, mood, traceId = null, identityProm
   return reply;
 }
 
-module.exports = { detectMood, callAI, getAIReply };
+module.exports = {
+  evaluateSystemDecision,
+  detectMood,
+  callAI,
+  getAIReply,
+};
