@@ -72,7 +72,7 @@ const CHANGE_WEIGHTS = {
   none: 0,
   minor: 1,
   significant: 2,
-  major: 4,
+  major: 6,
 };
 
 const DELTA_CAPS = {
@@ -81,6 +81,17 @@ const DELTA_CAPS = {
   significant: 5,
   major: 12,
 };
+
+const MAJOR_SHOCK_TARGETS = new Set([
+  "cautious",
+  "distrustful",
+  "disappointed",
+  "disliked",
+  "avoided",
+  "hostile",
+  "hated",
+  "estranged",
+]);
 
 function relationshipKey(personId) {
   return `relationship:${personId}`;
@@ -263,8 +274,34 @@ function normalizeDeltas(raw, strength) {
 function applyMetricDeltas(metrics, deltas) {
   const next = { ...metrics };
   for (const metric of Object.keys(DEFAULT_METRICS)) {
-    next[metric] = clamp((next[metric] || 0) + (deltas[metric] || 0));
+    const delta = metric === "familiarity"
+      ? Math.max(1, deltas[metric] || 0)
+      : (deltas[metric] || 0);
+    next[metric] = clamp((next[metric] || 0) + delta);
   }
+  return next;
+}
+
+function alignMetricsForStatus(metrics, status) {
+  const next = { ...metrics };
+  if (status === "cautious") next.trust = Math.min(next.trust, 45);
+  if (status === "distrustful") next.trust = Math.min(next.trust, 30);
+  if (status === "disappointed") next.trust = Math.min(next.trust, 42);
+  if (status === "disliked") {
+    next.affection = Math.min(next.affection, 28);
+    next.hostility = Math.max(next.hostility, 35);
+  }
+  if (status === "avoided") {
+    next.trust = Math.min(next.trust, 22);
+    next.hostility = Math.max(next.hostility, 45);
+  }
+  if (status === "hostile") next.hostility = Math.max(next.hostility, 60);
+  if (status === "hated") {
+    next.affection = Math.min(next.affection, 20);
+    next.hostility = Math.max(next.hostility, 70);
+  }
+  if (status === "enemy") next.hostility = Math.max(next.hostility, 78);
+  if (status === "estranged") next.trust = Math.min(next.trust, 28);
   return next;
 }
 
@@ -303,7 +340,13 @@ async function applyRelationshipDecision(personId, rawDecision = {}) {
 
   let transition = null;
   const allowed = recommendation !== state.status && allowedTargets(state.status).includes(recommendation);
-  const gated = allowed && metricsAllow(recommendation, state.metrics);
+  const shockOverride = Boolean(
+    allowed &&
+    strength === "major" &&
+    confidence >= 0.9 &&
+    MAJOR_SHOCK_TARGETS.has(recommendation)
+  );
+  const gated = allowed && (metricsAllow(recommendation, state.metrics) || shockOverride);
 
   if (!allowed || !gated || strength === "none" || confidence < 0.55) {
     decayPending(state);
@@ -330,6 +373,7 @@ async function applyRelationshipDecision(personId, rawDecision = {}) {
     if (state.pendingTransition.evidence >= threshold) {
       const previousStatus = state.status;
       state.status = recommendation;
+      state.metrics = alignMetricsForStatus(state.metrics, recommendation);
       state.lastChangedAt = now;
       transition = {
         from: previousStatus,
@@ -352,6 +396,7 @@ async function applyRelationshipDecision(personId, rawDecision = {}) {
       recommendation,
       allowed,
       metricsGatePassed: gated,
+      shockOverride,
       strength,
       confidence,
       deltas,
