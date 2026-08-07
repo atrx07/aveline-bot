@@ -1,17 +1,23 @@
 "use strict";
 
-const { groqClients } = require("../../config");
+const { groqClients, VALID_MOODS } = require("../../config");
 const { stats, liveFeed, runtime, addToFeed } = require("../../state");
 const {
   purgeAllMemory,
   purgeChatMemory,
+  saveMood,
 } = require("../../storage");
 const {
   listCanonicalChats,
   resetCanonicalMood,
   toggleCanonicalBlacklist,
 } = require("../../canonical-members");
+const { updateRelationshipAdmin } = require("../../relationship/admin");
 const { login } = require("../auth");
+
+function sendRouteError(res, error) {
+  res.status(Number(error?.status) || 500).json({ error: error?.message || "Request failed" });
+}
 
 function registerDashboardRoutes(app, authMiddleware) {
   app.post("/api/login", login);
@@ -45,7 +51,7 @@ function registerDashboardRoutes(app, authMiddleware) {
     try {
       res.json(await listCanonicalChats());
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      sendRouteError(res, error);
     }
   });
 
@@ -67,7 +73,7 @@ function registerDashboardRoutes(app, authMiddleware) {
       addToFeed({ type: "system", message: "All memory purged via dashboard" });
       res.json({ success: true, purged });
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      sendRouteError(res, error);
     }
   });
 
@@ -78,7 +84,7 @@ function registerDashboardRoutes(app, authMiddleware) {
       addToFeed({ type: "system", message: `Memory purged for ${chatId}` });
       res.json({ success: true });
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      sendRouteError(res, error);
     }
   });
 
@@ -87,7 +93,41 @@ function registerDashboardRoutes(app, authMiddleware) {
       await resetCanonicalMood(decodeURIComponent(req.params.chatId));
       res.json({ success: true });
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      sendRouteError(res, error);
+    }
+  });
+
+  app.post("/api/admin/mood/:scope", authMiddleware, async (req, res) => {
+    try {
+      const scope = decodeURIComponent(req.params.scope);
+      const mood = req.body?.mood;
+      if (!VALID_MOODS.includes(mood)) {
+        const error = new Error("Invalid mood");
+        error.status = 400;
+        throw error;
+      }
+
+      await saveMood(scope, mood);
+      addToFeed({ type: "system", message: `Mood override for ${scope}: ${mood}` });
+      res.json({ success: true, scope, mood });
+    } catch (error) {
+      sendRouteError(res, error);
+    }
+  });
+
+  app.post("/api/admin/relationship/:personId", authMiddleware, async (req, res) => {
+    try {
+      const personId = decodeURIComponent(req.params.personId);
+      const relationship = await updateRelationshipAdmin(personId, req.body || {});
+      addToFeed({
+        type: "system",
+        message: req.body?.reset === true
+          ? `Relationship reset for ${personId}`
+          : `Relationship override updated for ${personId}`,
+      });
+      res.json({ success: true, relationship });
+    } catch (error) {
+      sendRouteError(res, error);
     }
   });
 
@@ -101,7 +141,7 @@ function registerDashboardRoutes(app, authMiddleware) {
       });
       res.json({ blacklisted });
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      sendRouteError(res, error);
     }
   });
 }
