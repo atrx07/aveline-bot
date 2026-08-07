@@ -31,7 +31,7 @@ const groqClients = groqKeySlots
   .filter((slot) => slot.client)
   .map((slot) => slot.client);
 
-const moodGroqClient = process.env.GROQ_API_KEY_4
+const decisionGroqClient = process.env.GROQ_API_KEY_4
   ? new Groq({ apiKey: process.env.GROQ_API_KEY_4 })
   : null;
 
@@ -42,5 +42,7 @@ module.exports = {
   redis,
   groqClients,
   groqKeySlots,
-  moodGroqClient,
+  decisionGroqClient,
+  // Compatibility alias for older modules during staged deployments.
+  moodGroqClient: decisionGroqClient,
 };
