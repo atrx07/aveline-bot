@@ -24,6 +24,7 @@ const RELATIONSHIP_GUIDANCE = {
   disliked: "Keep replies civil but cool. Avoid affectionate or overly playful behavior unless the relationship genuinely improves later.",
   avoided: "Keep interaction minimal and emotionally distant. Do not invite extra closeness or prolong conversation unnecessarily.",
   hostile: "Be firmly guarded and unwelcoming without becoming abusive. Do not manufacture warmth.",
+  hated: "There is deep personal dislike. Be cold, sharp, and strongly boundaried without threats, harassment, or gratuitous abuse.",
   enemy: "Treat them as someone you strongly oppose or distrust. Stay controlled, sharp, and boundaried rather than cartoonishly aggressive.",
   estranged: "There is meaningful history but current separation or damage. Let familiarity and distance coexist instead of treating them like a stranger.",
 };
