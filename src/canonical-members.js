@@ -220,94 +220,113 @@ async function resetCanonicalMood(scope) {
   await Promise.all(keys.map((key) => redis.set(`mood:${key}`, "neutral")));
 }
 
-async function listCanonicalChats() {
-  const chats = await listChats();
+function bestLoadedMood(members) {
+  const moods = (members || []).map((member) => member?.mood).filter(Boolean);
+  return moods.find((mood) => mood !== "neutral") || moods[0] || "neutral";
+}
 
-  for (const chat of chats) {
-    if (!chat.isGroup) {
-      const identity = await resolveIdentity(chat.id);
-      chat.canonicalPersonId = identity.id || null;
-      chat.relationship = await relationshipForPerson(identity.id);
-      continue;
+async function canonicalizeGroupForDashboard(chat) {
+  if (!Array.isArray(chat.members) || !chat.members.length) return chat;
+
+  // listChats() has already loaded mood and blacklist state for every member.
+  // Resolve identities concurrently, then reuse those loaded values instead of
+  // repeating the same Redis reads during canonical dashboard shaping.
+  const resolvedMembers = await Promise.all(chat.members.map(async (member) => ({
+    member,
+    identity: await resolveIdentity(member.id),
+  })));
+
+  const buckets = new Map();
+  for (const { member, identity } of resolvedMembers) {
+    const canonicalId = identity.canonicalId || member.id;
+    let bucket = buckets.get(canonicalId);
+
+    if (!bucket) {
+      bucket = {
+        canonicalId,
+        aliases: new Set(identity.aliases),
+        identity,
+        legacyMembers: [],
+      };
+      buckets.set(canonicalId, bucket);
+    } else {
+      for (const alias of identity.aliases) bucket.aliases.add(alias);
+      if (!bucket.identity.person && identity.person) bucket.identity = identity;
     }
 
-    if (!Array.isArray(chat.members) || !chat.members.length) continue;
+    bucket.legacyMembers.push(member);
+  }
 
-    const buckets = new Map();
+  const canonicalMembers = await Promise.all([...buckets.values()].map(async (bucket) => {
+    const aliases = [...bucket.aliases];
+    const canonicalNameKey = `name:${chat.id}:${bucket.canonicalId}`;
+    const personId = bucket.identity.id || (isPersonId(bucket.canonicalId) ? bucket.canonicalId : null);
 
-    for (const member of chat.members) {
-      const identity = await resolveIdentity(member.id);
-      const canonicalId = identity.canonicalId || member.id;
-      let bucket = buckets.get(canonicalId);
+    const [canonicalName, relationship] = await Promise.all([
+      redis.get(canonicalNameKey).catch(() => null),
+      relationshipForPerson(personId),
+    ]);
 
-      if (!bucket) {
-        bucket = {
-          canonicalId,
-          aliases: new Set(identity.aliases),
-          identity,
-          legacyMembers: [],
-        };
-        buckets.set(canonicalId, bucket);
-      } else {
-        for (const alias of identity.aliases) bucket.aliases.add(alias);
-        if (!bucket.identity.person && identity.person) bucket.identity = identity;
-      }
+    const legacyName = bucket.legacyMembers
+      .map((member) => member.name)
+      .find((value) => value && !/^\+?\d+$/.test(String(value)));
 
-      bucket.legacyMembers.push(member);
+    const name = canonicalName ||
+      bucket.identity.person?.displayName ||
+      legacyName ||
+      bucket.canonicalId.split("@")[0];
+
+    // Mood and blacklist were already resolved by listChats(). When legacy PN/LID
+    // rows collapse into one canonical person, preserve the strongest loaded state.
+    const mood = bestLoadedMood(bucket.legacyMembers);
+    const blacklisted = bucket.legacyMembers.some((member) => Boolean(member.blacklisted));
+
+    if (!canonicalName && name) {
+      await redis.set(canonicalNameKey, name).catch(() => {});
     }
 
-    const canonicalMembers = [];
+    return {
+      id: bucket.canonicalId,
+      canonicalPersonId: personId,
+      aliases,
+      name,
+      mood,
+      relationship,
+      blacklisted,
+    };
+  }));
 
-    for (const bucket of buckets.values()) {
-      const aliases = [...bucket.aliases];
-      const canonicalNameKey = `name:${chat.id}:${bucket.canonicalId}`;
-      let canonicalName = null;
+  chat.members = canonicalMembers;
 
-      try {
-        canonicalName = await redis.get(canonicalNameKey);
-      } catch {}
+  // Keep the lazy legacy-ID migration, but avoid rewriting an already canonical
+  // member list every time the dashboard opens.
+  const previousIds = resolvedMembers.map(({ member }) => member.id);
+  const canonicalIds = canonicalMembers.map((member) => member.id);
+  const membershipChanged = previousIds.length !== canonicalIds.length ||
+    previousIds.some((id, index) => id !== canonicalIds[index]);
 
-      const legacyName = bucket.legacyMembers
-        .map((member) => member.name)
-        .find((value) => value && !/^\+?\d+$/.test(String(value)));
-
-      const name = canonicalName ||
-        bucket.identity.person?.displayName ||
-        legacyName ||
-        bucket.canonicalId.split("@")[0];
-
-      const mood = await loadCanonicalMemberMood(
-        chat.id,
-        bucket.canonicalId,
-        aliases,
-        bucket.legacyMembers
-      );
-      const blacklisted = await isCanonicalBlacklisted(bucket.canonicalId);
-      const personId = bucket.identity.id || (isPersonId(bucket.canonicalId) ? bucket.canonicalId : null);
-      const relationship = await relationshipForPerson(personId);
-
-      if (!canonicalName && name) {
-        await redis.set(canonicalNameKey, name).catch(() => {});
-      }
-
-      canonicalMembers.push({
-        id: bucket.canonicalId,
-        canonicalPersonId: personId,
-        aliases,
-        name,
-        mood,
-        relationship,
-        blacklisted,
-      });
-    }
-
-    chat.members = canonicalMembers;
-
-    const canonicalIds = canonicalMembers.map((member) => member.id);
+  if (membershipChanged) {
     await redis.set(`members:${chat.id}`, canonicalIds).catch(() => {});
   }
 
-  return chats;
+  return chat;
+}
+
+async function canonicalizeDirectChatForDashboard(chat) {
+  const identity = await resolveIdentity(chat.id);
+  chat.canonicalPersonId = identity.id || null;
+  chat.relationship = await relationshipForPerson(identity.id);
+  return chat;
+}
+
+async function listCanonicalChats() {
+  const chats = await listChats();
+
+  // Process independent chats concurrently. This keeps the response shape and
+  // canonicalization behavior identical while removing the serial Redis waterfall.
+  return Promise.all(chats.map((chat) => chat.isGroup
+    ? canonicalizeGroupForDashboard(chat)
+    : canonicalizeDirectChatForDashboard(chat)));
 }
 
 module.exports = {
