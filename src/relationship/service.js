@@ -26,6 +26,7 @@ const RELATIONSHIP_STATUSES = [
   "disliked",
   "avoided",
   "hostile",
+  "hated",
   "enemy",
   "estranged",
 ];
@@ -51,10 +52,11 @@ const RELATIONSHIP_GRAPH = {
   distrustful: ["cautious", "familiar", "friend", "disappointed", "disliked", "avoided", "hostile", "estranged"],
   uneasy: ["stranger", "acquaintance", "cautious", "disliked", "avoided"],
   disappointed: ["friend", "close_friend", "distant_friend", "distrustful", "disliked", "estranged"],
-  disliked: ["acquaintance", "cautious", "distrustful", "avoided", "hostile"],
-  avoided: ["cautious", "distrustful", "disliked", "hostile", "estranged"],
-  hostile: ["distrustful", "disliked", "avoided", "enemy", "rival"],
-  enemy: ["hostile", "rival", "avoided"],
+  disliked: ["acquaintance", "cautious", "distrustful", "avoided", "hostile", "hated"],
+  avoided: ["cautious", "distrustful", "disliked", "hostile", "hated", "estranged"],
+  hostile: ["distrustful", "disliked", "avoided", "hated", "enemy", "rival"],
+  hated: ["hostile", "avoided", "enemy"],
+  enemy: ["hated", "hostile", "rival", "avoided"],
   estranged: ["distant_friend", "distrustful", "avoided", "friend"],
 };
 
@@ -112,6 +114,32 @@ function defaultRelationship(personId) {
   };
 }
 
+function transitionThreshold(from, to) {
+  const key = `${from}->${to}`;
+  const special = {
+    "stranger->acquaintance": 3,
+    "acquaintance->familiar": 4,
+    "familiar->friend": 5,
+    "friend->close_friend": 6,
+    "close_friend->best_friend": 7,
+    "close_friend->confidant": 6,
+    "friend->confidant": 7,
+    "flirty->crush": 6,
+    "crush->romantic_interest": 7,
+    "romantic_interest->partner": 8,
+    "hostile->hated": 6,
+    "hated->enemy": 7,
+    "hostile->enemy": 7,
+    "enemy->hated": 5,
+    "enemy->hostile": 5,
+  };
+  if (special[key]) return special[key];
+
+  if (["distrustful", "disliked", "avoided", "hostile", "hated", "estranged"].includes(to)) return 4;
+  if (["enemy", "best_friend", "partner"].includes(to)) return 7;
+  return 5;
+}
+
 function normalizeRelationship(value, personId) {
   const base = defaultRelationship(personId);
   if (!value || typeof value !== "object") return base;
@@ -129,6 +157,7 @@ function normalizeRelationship(value, personId) {
     ? {
         target: value.pendingTransition.target,
         evidence: Math.max(0, Number(value.pendingTransition.evidence) || 0),
+        threshold: Math.max(1, Number(value.pendingTransition.threshold) || transitionThreshold(status, value.pendingTransition.target)),
         firstSeenAt: Number(value.pendingTransition.firstSeenAt) || Date.now(),
         lastSeenAt: Number(value.pendingTransition.lastSeenAt) || Date.now(),
         reason: cleanText(value.pendingTransition.reason),
@@ -179,29 +208,6 @@ function allowedTargets(status) {
   return RELATIONSHIP_GRAPH[status] || [];
 }
 
-function transitionThreshold(from, to) {
-  const key = `${from}->${to}`;
-  const special = {
-    "stranger->acquaintance": 3,
-    "acquaintance->familiar": 4,
-    "familiar->friend": 5,
-    "friend->close_friend": 6,
-    "close_friend->best_friend": 7,
-    "close_friend->confidant": 6,
-    "friend->confidant": 7,
-    "flirty->crush": 6,
-    "crush->romantic_interest": 7,
-    "romantic_interest->partner": 8,
-    "hostile->enemy": 7,
-    "enemy->hostile": 5,
-  };
-  if (special[key]) return special[key];
-
-  if (["distrustful", "disliked", "avoided", "hostile", "estranged"].includes(to)) return 4;
-  if (["enemy", "best_friend", "partner"].includes(to)) return 7;
-  return 5;
-}
-
 function metricsAllow(target, metrics) {
   const m = metrics;
   const rules = {
@@ -227,6 +233,7 @@ function metricsAllow(target, metrics) {
     disliked: () => m.affection <= 28 || m.hostility >= 35,
     avoided: () => m.trust <= 22 || m.hostility >= 45,
     hostile: () => m.hostility >= 60,
+    hated: () => m.hostility >= 70 && m.affection <= 20,
     enemy: () => m.hostility >= 78,
     estranged: () => m.familiarity >= 45 && (m.trust <= 28 || m.affection <= 28),
     stranger: () => m.familiarity <= 15,
@@ -302,22 +309,24 @@ async function applyRelationshipDecision(personId, rawDecision = {}) {
     decayPending(state);
   } else {
     const weight = CHANGE_WEIGHTS[strength] + (confidence >= 0.9 ? 1 : 0);
+    const threshold = transitionThreshold(state.status, recommendation);
 
     if (state.pendingTransition?.target === recommendation) {
       state.pendingTransition.evidence += weight;
+      state.pendingTransition.threshold = threshold;
       state.pendingTransition.lastSeenAt = now;
       state.pendingTransition.reason = reason || state.pendingTransition.reason;
     } else {
       state.pendingTransition = {
         target: recommendation,
         evidence: weight,
+        threshold,
         firstSeenAt: now,
         lastSeenAt: now,
         reason,
       };
     }
 
-    const threshold = transitionThreshold(state.status, recommendation);
     if (state.pendingTransition.evidence >= threshold) {
       const previousStatus = state.status;
       state.status = recommendation;
