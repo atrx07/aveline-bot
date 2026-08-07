@@ -2,6 +2,10 @@
 
 const { redis } = require("./config");
 const { listChats } = require("./storage");
+const {
+  loadRelationship,
+  publicRelationship,
+} = require("./relationship/service");
 
 function normalizeAlias(value) {
   if (typeof value !== "string" || !value.includes("@")) return null;
@@ -146,6 +150,11 @@ async function loadCanonicalMemberMood(groupId, canonicalId, aliases, legacyMemb
   return mood;
 }
 
+async function relationshipForPerson(personId) {
+  if (!isPersonId(personId)) return null;
+  return publicRelationship(await loadRelationship(personId));
+}
+
 async function isCanonicalBlacklisted(identifier) {
   if (await directBlacklisted(identifier)) return true;
 
@@ -215,7 +224,14 @@ async function listCanonicalChats() {
   const chats = await listChats();
 
   for (const chat of chats) {
-    if (!chat.isGroup || !Array.isArray(chat.members) || !chat.members.length) continue;
+    if (!chat.isGroup) {
+      const identity = await resolveIdentity(chat.id);
+      chat.canonicalPersonId = identity.id || null;
+      chat.relationship = await relationshipForPerson(identity.id);
+      continue;
+    }
+
+    if (!Array.isArray(chat.members) || !chat.members.length) continue;
 
     const buckets = new Map();
 
@@ -267,6 +283,8 @@ async function listCanonicalChats() {
         bucket.legacyMembers
       );
       const blacklisted = await isCanonicalBlacklisted(bucket.canonicalId);
+      const personId = bucket.identity.id || (isPersonId(bucket.canonicalId) ? bucket.canonicalId : null);
+      const relationship = await relationshipForPerson(personId);
 
       if (!canonicalName && name) {
         await redis.set(canonicalNameKey, name).catch(() => {});
@@ -274,9 +292,11 @@ async function listCanonicalChats() {
 
       canonicalMembers.push({
         id: bucket.canonicalId,
+        canonicalPersonId: personId,
         aliases,
         name,
         mood,
+        relationship,
         blacklisted,
       });
     }
