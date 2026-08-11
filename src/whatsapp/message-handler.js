@@ -22,12 +22,20 @@ const {
   isBlacklisted,
   saveStats,
 } = require("../storage");
-const { evaluateSystemDecision, getAIReply } = require("../ai/service");
+const { getAIReply } = require("../ai/service");
+const { evaluateSystemDecision } = require("../ai/system-decision");
 const {
   loadRelationship,
   applyRelationshipDecision,
   publicRelationship,
 } = require("../relationship/service");
+const {
+  loadInteractionState,
+  resolveResponseAction,
+  recordResponseAction,
+  recordNonTextMemory,
+  publicInteractionState,
+} = require("../interaction/service");
 const { resolveIdentity } = require("../canonical-members");
 const {
   prepareIncomingMessage,
@@ -249,22 +257,32 @@ async function handleAI(sock, msg, { traceId, prepared }) {
   });
 
   try {
-    await sock.sendPresenceUpdate("composing", from);
+    const [relationshipBefore, interactionBefore] = await Promise.all([
+      personId ? loadRelationship(personId) : Promise.resolve(null),
+      personId ? loadInteractionState(personId) : Promise.resolve(null),
+    ]);
 
-    const relationshipBefore = personId ? await loadRelationship(personId) : null;
     const systemDecision = await evaluateSystemDecision({
       chatId: from,
       text,
       name: senderName,
       relationship: relationshipBefore,
+      interactionState: interactionBefore,
       traceId,
     });
-    const mood = systemDecision.mood;
 
     const relationshipResult = personId
       ? await applyRelationshipDecision(personId, systemDecision.relationship)
       : { state: relationshipBefore, transition: null, applied: false, evaluation: null };
     const relationship = relationshipResult.state || relationshipBefore;
+
+    const responsePlan = await resolveResponseAction(
+      personId,
+      systemDecision.response,
+      systemDecision.mood,
+      interactionBefore
+    );
+    const mood = responsePlan.effectiveMood || systemDecision.mood;
 
     mutateDebugTrace(traceId, (trace) => {
       trace.relationship = {
@@ -274,6 +292,20 @@ async function handleAI(sock, msg, { traceId, prepared }) {
         evaluation: relationshipResult.evaluation || null,
         transition: relationshipResult.transition || null,
         after: publicRelationship(relationship),
+      };
+      trace.interaction = {
+        personId,
+        before: publicInteractionState(interactionBefore),
+        recommendation: systemDecision.response,
+        resolved: {
+          action: responsePlan.action,
+          reaction: responsePlan.reaction,
+          effectiveMood: mood,
+          replyRequired: responsePlan.reply_required,
+          importance: responsePlan.importance,
+          policyReason: responsePlan.policyReason,
+          repairSignal: responsePlan.repair_signal,
+        },
       };
     });
 
@@ -287,20 +319,60 @@ async function handleAI(sock, msg, { traceId, prepared }) {
       });
     }
 
-    await saveMood(from, mood);
-    if (isGroup && userId) await saveMood(`${from}:${userId}`, mood);
+    const moodWrites = [saveMood(from, mood)];
+    if (isGroup && userId) moodWrites.push(saveMood(`${from}:${userId}`, mood));
+    await Promise.all(moodWrites);
 
-    const reply = await getAIReply(
-      from,
-      text,
-      senderName,
+    let action = responsePlan.action;
+    let reaction = action === "react" ? responsePlan.reaction : null;
+    let reply = null;
+    let stickerSent = null;
+    let reactionFallbackError = null;
+
+    if (action === "react") {
+      try {
+        await sock.sendMessage(from, {
+          react: {
+            text: reaction,
+            key: msg.key,
+          },
+        });
+        await recordNonTextMemory(from, text, senderName, "react", reaction);
+      } catch (error) {
+        reactionFallbackError = safeError(error);
+        console.error("[reaction] Failed to react, falling back to reply:", error.message);
+        action = "reply";
+        reaction = null;
+      }
+    }
+
+    if (action === "silent") {
+      await recordNonTextMemory(from, text, senderName, "silent");
+    }
+
+    if (action === "reply") {
+      await sock.sendPresenceUpdate("composing", from);
+      reply = await getAIReply(
+        from,
+        text,
+        senderName,
+        mood,
+        relationship,
+        traceId,
+        prepared?.identityPrompt || null
+      );
+      await sock.sendMessage(from, { text: reply }, { quoted: msg });
+      stickerSent = await maybeSendMoodSticker(sock, from, mood);
+    }
+
+    await recordResponseAction(personId, {
+      action,
+      reaction,
       mood,
-      relationship,
-      traceId,
-      prepared?.identityPrompt || null
-    );
-    await sock.sendMessage(from, { text: reply }, { quoted: msg });
-    const stickerSent = await maybeSendMoodSticker(sock, from, mood);
+      reason: action === responsePlan.action
+        ? responsePlan.policyReason
+        : "reaction delivery failed; fell back to text reply",
+    }, responsePlan.state);
 
     const responseTime = Date.now() - startedAt;
     stats.totalMessages++;
@@ -309,6 +381,12 @@ async function handleAI(sock, msg, { traceId, prepared }) {
     stats.responseTimes.push(responseTime);
     if (stats.responseTimes.length > 100) stats.responseTimes.shift();
 
+    const feedResult = action === "reply"
+      ? reply
+      : action === "react"
+        ? `[reacted ${reaction}]`
+        : "[no text reply]";
+
     addToFeed({
       type: "message",
       from,
@@ -316,20 +394,37 @@ async function handleAI(sock, msg, { traceId, prepared }) {
       groupName,
       isGroup,
       text: text.slice(0, 200),
-      reply: reply.slice(0, 200),
+      reply: String(feedResult || "").slice(0, 200),
+      responseMode: action,
+      reaction,
       mood,
       relationship: relationship?.status || null,
       responseTime,
+    });
+
+    mutateDebugTrace(traceId, (trace) => {
+      trace.interaction = {
+        ...(trace.interaction || {}),
+        final: {
+          action,
+          reaction,
+          reactionFallbackError,
+          after: publicInteractionState(responsePlan.state),
+        },
+      };
     });
 
     updateDebugTrace(traceId, {
       status: "completed",
       completedAt: Date.now(),
       delivery: {
+        mode: action,
         replyText: reply,
-        quotedMessage: true,
-        sentToWhatsApp: true,
+        reaction,
+        quotedMessage: action === "reply",
+        sentToWhatsApp: action !== "silent",
         stickerSent,
+        reactionFallbackError,
         responseTimeMs: responseTime,
       },
     });
