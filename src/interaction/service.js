@@ -9,6 +9,7 @@ const REACTION_EMOJIS = [
   "😂", "😭", "💀", "😒", "🙄", "😐", "😏", "❤️", "🥰", "👍",
   "👀", "🤨", "🔥", "👏", "🙏", "👋", "🤝", "🫠", "😮", "😌",
 ];
+const ANNOYED_REACTIONS = ["😒", "🙄", "😐", "🤨"];
 
 const cache = new Map();
 
@@ -143,27 +144,33 @@ async function resolveResponseAction(personId, rawDecision, mood, providedState 
   const recentNonText = recentNonTextCount(state);
 
   if (action === "react" && effectiveMood !== "annoyed") {
-    if (previous?.action === "react") {
+    if (decision.silence_safe && (previous?.action === "react" || previous?.action === "silent")) {
+      action = "silent";
+      policyReason = "conversation was already closed; suppressed another farewell response";
+    } else if (!decision.silence_safe && previous?.action === "react") {
       action = "reply";
       policyReason = "prevented consecutive reaction-only responses";
-    } else if (recentNonText >= 2) {
+    } else if (!decision.silence_safe && recentNonText >= 2) {
       action = "reply";
       policyReason = "reaction budget reached; preserved text replies";
     }
   }
 
-  if (action === "silent" && effectiveMood !== "annoyed" && recentNonText >= 2) {
+  if (
+    action === "silent" &&
+    effectiveMood !== "annoyed" &&
+    !decision.silence_safe &&
+    recentNonText >= 2
+  ) {
     action = "reply";
     policyReason = "non-text budget reached; preserved text replies";
   }
 
-  if (effectiveMood === "annoyed") {
-    if (action === "react") {
-      reaction = REACTION_EMOJIS.includes(decision.reaction) ? decision.reaction : "😒";
-      if (state.consecutiveReactions >= 4) {
-        action = "silent";
-        policyReason = "annoyed reaction streak capped; switched to silence";
-      }
+  if (effectiveMood === "annoyed" && action === "react") {
+    reaction = ANNOYED_REACTIONS.includes(decision.reaction) ? decision.reaction : "😒";
+    if (state.consecutiveReactions >= 4) {
+      action = "silent";
+      policyReason = "annoyed reaction streak capped; switched to silence";
     }
   }
 
