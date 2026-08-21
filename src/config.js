@@ -5,10 +5,11 @@ const Groq = require("groq-sdk");
 
 const MEMORY_LIMIT = 20;
 const MODELS = [
-  "llama-3.3-70b-versatile",
-  "llama-3.1-8b-instant",
+  "qwen/qwen3.6-27b",
+  "openai/gpt-oss-20b",
   "openai/gpt-oss-120b",
 ];
+const DECISION_MODEL = "openai/gpt-oss-20b";
 const VALID_MOODS = ["happy", "neutral", "teasing", "annoyed", "affectionate"];
 
 const redis = new Redis({
@@ -38,6 +39,7 @@ const decisionGroqClient = process.env.GROQ_API_KEY_4
 module.exports = {
   MEMORY_LIMIT,
   MODELS,
+  DECISION_MODEL,
   VALID_MOODS,
   redis,
   groqClients,
