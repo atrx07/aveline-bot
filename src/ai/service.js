@@ -40,6 +40,8 @@ function requestSnapshot(request) {
     model: request?.model || null,
     max_tokens: request?.max_tokens ?? null,
     temperature: request?.temperature ?? null,
+    reasoning_effort: request?.reasoning_effort ?? null,
+    include_reasoning: request?.include_reasoning ?? null,
     messages: Array.isArray(request?.messages)
       ? request.messages.map((message) => ({
           role: message?.role || null,
@@ -53,6 +55,29 @@ function requestSnapshot(request) {
 
 function sanitizeInternalMentions(value) {
   return typeof value === "string" ? value.replace(/@\d{5,}/g, "@someone") : value;
+}
+
+function sanitizeModelOutput(value) {
+  let text = sanitizeInternalMentions(String(value || "").trim());
+
+  // Defensive guard for reasoning-capable models. Normal Qwen chat requests run
+  // with reasoning disabled, but never allow a tagged chain-of-thought block to
+  // enter WhatsApp or conversational memory if a provider/model regresses.
+  text = text.replace(/<think>[\s\S]*?<\/think>\s*/gi, "").trim();
+
+  if (/<think>/i.test(text) || /<\/think>/i.test(text)) {
+    const error = new Error("reasoning_leak_blocked");
+    error.code = "reasoning_leak_blocked";
+    throw error;
+  }
+
+  if (!text) {
+    const error = new Error("empty_model_output");
+    error.code = "empty_model_output";
+    throw error;
+  }
+
+  return text;
 }
 
 function sanitizeMemory(memory) {
@@ -365,6 +390,9 @@ async function callAI(messages, traceId = null, identityPrompt = null) {
         messages: finalMessages,
         max_tokens: 300,
         temperature: 0.85,
+        ...(model === "qwen/qwen3.6-27b"
+          ? { reasoning_effort: "none", include_reasoning: false }
+          : {}),
       };
       const attemptStartedAt = Date.now();
 
@@ -390,7 +418,7 @@ async function callAI(messages, traceId = null, identityPrompt = null) {
         stats.keyUsage[`key${keyNumber}`] = (stats.keyUsage[`key${keyNumber}`] || 0) + 1;
         console.log(`[AI] Response from key ${keyNumber} / model: ${model}`);
 
-        const output = sanitizeInternalMentions(completion.choices[0].message.content.trim());
+        const output = sanitizeModelOutput(completion.choices[0].message.content);
         updateDebugTrace(traceId, {
           selectedGroqResult: {
             model,
@@ -421,6 +449,8 @@ async function callAI(messages, traceId = null, identityPrompt = null) {
           console.log(`[AI] Key ${keyNumber} rate limited on ${model} → cooldown + next pair`);
         } else if (error.message === "timeout") {
           console.log(`[AI] Key ${keyNumber} timed out on ${model} → short cooldown + next pair`);
+        } else if (error.message === "reasoning_leak_blocked") {
+          console.log(`[AI] Blocked leaked reasoning from key ${keyNumber} / ${model}`);
         } else {
           console.log(`[AI] Key ${keyNumber} error on ${model}:`, error.message || error);
         }
