@@ -30,6 +30,7 @@ function defaultState(keyNumber, model) {
     failureCount: 0,
     lastError: null,
     disabled: false,
+    modelUnavailable: false,
   };
 }
 
@@ -46,6 +47,7 @@ function normalizeState(value, keyNumber, model) {
     lastFailureAt: Number(value.lastFailureAt) || 0,
     failureCount: Number(value.failureCount) || 0,
     disabled: Boolean(value.disabled),
+    modelUnavailable: Boolean(value.modelUnavailable),
   };
 }
 
@@ -106,6 +108,9 @@ function classifyFailure(error) {
   if (status === 401 || status === 403) {
     return { type: "disabled", durationMs: 0, reason: `http_${status}`, message };
   }
+  if (status === 404) {
+    return { type: "model_unavailable", durationMs: 0, reason: "model_unavailable", message };
+  }
   if (status === 429) {
     return { type: "cooldown", durationMs: RATE_LIMIT_COOLDOWN_MS, reason: "rate_limit", message };
   }
@@ -128,6 +133,21 @@ async function markFailure(keyNumber, model, error) {
 
   const state = getState(keyNumber, model);
   const now = Date.now();
+
+  if (failure.type === "model_unavailable") {
+    Object.assign(state, {
+      status: "model_unavailable",
+      modelUnavailable: true,
+      cooldownUntil: 0,
+      reason: failure.reason,
+      lastFailureAt: now,
+      failureCount: state.failureCount + 1,
+      lastError: failure.message,
+    });
+    await persist(state);
+    return failure;
+  }
+
   Object.assign(state, {
     status: failure.type === "cooldown" ? "cooldown" : "available",
     cooldownUntil: failure.durationMs ? now + failure.durationMs : 0,
@@ -151,6 +171,7 @@ async function markSuccess(keyNumber, model) {
     failureCount: 0,
     lastError: null,
     disabled: false,
+    modelUnavailable: false,
   });
   await persist(state);
 }
@@ -159,6 +180,9 @@ async function eligibility(keyNumber, model, now = Date.now()) {
   await hydrate();
   const state = getState(keyNumber, model);
   if (state.disabled) return { eligible: false, state, reason: "disabled", remainingMs: null };
+  if (state.modelUnavailable) {
+    return { eligible: false, state, reason: "model_unavailable", remainingMs: null };
+  }
   if (state.cooldownUntil > now) {
     return {
       eligible: false,
@@ -191,6 +215,7 @@ async function getRouterHealth() {
         let status = state.status;
         if (!configured) status = "not_configured";
         else if (state.disabled) status = "disabled";
+        else if (state.modelUnavailable) status = "model_unavailable";
         else if (state.cooldownUntil > now) status = "cooldown";
         else if (state.cooldownUntil) status = "ready_to_probe";
         else if (status === "unknown") status = "available";
