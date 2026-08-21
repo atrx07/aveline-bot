@@ -406,6 +406,9 @@ async function callAI(messages, traceId = null, identityPrompt = null) {
           purpose: "reply",
         });
 
+        // Validate/sanitize before recording this pair as healthy or successful.
+        const output = sanitizeModelOutput(completion.choices[0].message.content);
+
         await markPairSuccess(keyNumber, model);
         appendRouterEvent(traceId, "attempted", {
           keyNumber,
@@ -418,7 +421,6 @@ async function callAI(messages, traceId = null, identityPrompt = null) {
         stats.keyUsage[`key${keyNumber}`] = (stats.keyUsage[`key${keyNumber}`] || 0) + 1;
         console.log(`[AI] Response from key ${keyNumber} / model: ${model}`);
 
-        const output = sanitizeModelOutput(completion.choices[0].message.content);
         updateDebugTrace(traceId, {
           selectedGroqResult: {
             model,
