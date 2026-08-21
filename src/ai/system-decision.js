@@ -3,7 +3,7 @@
 const crypto = require("crypto");
 const {
   decisionGroqClient,
-  MODELS,
+  DECISION_MODEL,
   VALID_MOODS,
 } = require("../config");
 const {
@@ -38,6 +38,9 @@ function requestSnapshot(request) {
     model: request?.model || null,
     max_tokens: request?.max_tokens ?? null,
     temperature: request?.temperature ?? null,
+    reasoning_effort: request?.reasoning_effort ?? null,
+    include_reasoning: request?.include_reasoning ?? null,
+    response_format: request?.response_format ?? null,
     messages: Array.isArray(request?.messages)
       ? request.messages.map((message) => ({
           role: message?.role || null,
@@ -202,9 +205,12 @@ async function evaluateSystemDecision({
   const publicInteraction = publicInteractionState(interactionState);
 
   const request = {
-    model: MODELS[0],
+    model: DECISION_MODEL,
     temperature: 0.2,
     max_tokens: 500,
+    reasoning_effort: "low",
+    include_reasoning: false,
+    response_format: { type: "json_object" },
     messages: [
       {
         role: "system",
