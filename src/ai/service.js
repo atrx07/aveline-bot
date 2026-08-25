@@ -22,6 +22,10 @@ const {
   RELATIONSHIP_GRAPH,
 } = require("../relationship/service");
 const {
+  calculateNaturalReplyDelay,
+  sleep,
+} = require("../interaction/timing");
+const {
   getPairEligibility,
   markPairFailure,
   markPairSuccess,
@@ -60,9 +64,6 @@ function sanitizeInternalMentions(value) {
 function sanitizeModelOutput(value) {
   let text = sanitizeInternalMentions(String(value || "").trim());
 
-  // Defensive guard for reasoning-capable models. Normal Qwen chat requests run
-  // with reasoning disabled, but never allow a tagged chain-of-thought block to
-  // enter WhatsApp or conversational memory if a provider/model regresses.
   text = text.replace(/<think>[\s\S]*?<\/think>\s*/gi, "").trim();
 
   if (/<think>/i.test(text) || /<\/think>/i.test(text)) {
@@ -406,7 +407,6 @@ async function callAI(messages, traceId = null, identityPrompt = null) {
           purpose: "reply",
         });
 
-        // Validate/sanitize before recording this pair as healthy or successful.
         const output = sanitizeModelOutput(completion.choices[0].message.content);
 
         await markPairSuccess(keyNumber, model);
@@ -520,7 +520,24 @@ async function getAIReply(
     };
   });
 
+  const generationStartedAt = Date.now();
   const reply = await callAI(messagesBeforeIdentityInjection, traceId, identityPrompt);
+  const generationElapsedMs = Date.now() - generationStartedAt;
+  const timing = calculateNaturalReplyDelay({
+    incomingText: safeText,
+    replyText: reply,
+    mood,
+    elapsedMs: generationElapsedMs,
+  });
+
+  mutateDebugTrace(traceId, (trace) => {
+    trace.ai = {
+      ...(trace.ai || {}),
+      naturalTiming: timing,
+    };
+  });
+
+  await sleep(timing.remainingMs);
 
   memory.push({ role: "assistant", content: reply });
   await saveMemory(chatId, memory);
